@@ -1,0 +1,1163 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# #  Template para Cálculo del LTV
+# 
+# En este notebook se calcula el **LTV estimado o predicho** para medir el rendimiento del modelo, usando los modelos antes entrenados para cada uno de los módulos.
+# 
+# Para ello, a partir de las predicciones de percentil de ingresos y costos, se calcula su valor correspondiente, y sumado a la probabilidad de fuga se tiene todo para calcular el LTV.
+# 
+# $$ LTV =  \sum_{k=1}^3 \frac{1}{(1+t)^k} (1-P_{fuga}(k)) \widehat{margen}(k)$$
+# 
+# 
+# 
+# Para ello se calcula el 'margen_estimado' como la resta entre el 'ingreso_estimado' y el 'costo_estimado'
+# 
+# * Input: 
+#     - LTV_{mes}.csv
+#     - `LTV.LTV_features_resumen_pasado_PIT`. Dataframe con información de todos los afiliados, con historial hacia el pasado, para varios PIT, todo calculado desde bigQuery, reducido de categorías tras limpieza en preprocesing.
+#     - Cada uno de los modelos de h2o.
+# * Output:
+#    - LTV.PREDICCION_MODULOS_LTV_{mes}{año}
+#    - LTV.PREDICCION_LTV_CATLTV_{mes}{año}
+#     
+
+# In[ ]:
+
+
+get_ipython().run_line_magic('load_ext', 'autoreload')
+get_ipython().run_line_magic('autoreload', '2')
+
+
+# In[ ]:
+
+
+import time
+import os
+from numba import njit, prange
+import pandas as pd
+import json
+import great_expectations as ge
+import numpy as np
+import h2o
+import re
+from sklearn.preprocessing import QuantileTransformer
+from google.cloud import bigquery
+np.random.seed(54321)
+
+import snowflake.connector as snow_con
+import getpass as gp
+
+# import feather
+from IPython.core.display import display, HTML
+display(HTML("<style>.container { width:95% !important; }</style>"))
+pd.set_option('display.max_columns',2000)
+
+
+# In[ ]:
+
+
+#1. Ubicación de datos y nombre de proyecto (Varía entre Colmena y Spike)
+###########################################################
+pid = "estudios-242917"
+datos_ltv_folder = "/estudio/data/ltv/Input/"
+#asume que existen las carpetas "Greats_expectations_LTV", "models", "Output"
+carpeta_ltv = "/estudio/data/ltv/" 
+
+#2. Cambiar: Qué periodo se va a predecir?
+###########################################################
+#descomentar si se quiere definir el periodo manualmente
+#periodo_de_prediccion = '202201' #añomes. p.ej'201905'
+fecha_prediccion =  pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
+periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+
+
+#La base debe tener el periodo que se va a predecir en su nombre ej. -> marzo: 20.04.16 LTV_202003.csv
+
+# descomentar si se sube el archivo manualmente
+# for _, _, files in os.walk(datos_ltv_folder):
+#     for file in files:
+#         if periodo_de_prediccion in file and 'ltv' in file.lower():  
+#             nombre_base = file
+#             break
+# print(nombre_base)
+
+
+## 22.01.18_LTV_202112_dic21
+
+
+
+###########################################################
+
+num_a_mes = {
+    1: 'ene', 2: 'feb', 3: 'mar',  4: 'abr',  5: 'may',  6: 'jun',
+    7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'
+}
+
+mes_actual = fecha_prediccion.month
+año = f"{fecha_prediccion:%y}"
+nombre_fancy = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}" #P ej: "may19"
+                
+nombre_base = f"{fecha_prediccion:%y.%m.%d}_LTV_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}.gz"
+    
+
+if mes_actual == 1:
+    mes_anterior = 12
+    nombre_fancy_mes_anterior = num_a_mes[mes_anterior] + str((int(año)-1))
+else:
+    mes_anterior = mes_actual - 1
+    nombre_fancy_mes_anterior = num_a_mes[mes_anterior] + año
+
+nombre_tabla = f"LTV.ltv_{nombre_fancy}"
+nombre_base_consolidada = "LTV_NEW_" + nombre_fancy
+nombre_ltv_new_mes_anterior = "LTV_NEW_" + nombre_fancy_mes_anterior
+
+
+start = time.time()
+print(time.asctime(time.localtime(start)))
+
+
+# In[ ]:
+
+
+print(nombre_tabla, nombre_base_consolidada, nombre_ltv_new_mes_anterior, nombre_base)
+
+
+# In[ ]:
+
+
+snow_user = gp.getpass("snow_user")
+snow_pass = gp.getpass("snow_pass")
+snow_account = "isapre_colmena.us-east-1"
+snow_warehouse = "P_OPX"
+
+snow = snow_con.connect(user=snow_user,
+                        password=snow_pass,
+                        account=snow_account,
+                        warehouse=snow_warehouse
+                        )
+
+
+# In[ ]:
+
+
+
+
+with snow.cursor() as cur:
+    print(f"{periodo_prediccion}")
+    cur.execute(f"SET (per_desde, per_hasta) = ({periodo_prediccion}, {periodo_prediccion}); ")
+    cur.execute('SELECT * FROM EST.P_DDV_EST.JC_PRED_LTV_INPUT;')
+    data_ltv_snow = cur.fetch_pandas_all()
+    data_ltv_snow.to_csv(datos_ltv_folder+nombre_base, index=False, compression='gzip')
+
+
+# In[ ]:
+
+
+data_ltv_snow.describe()
+
+
+# In[ ]:
+
+
+data_ltv_snow.head()
+
+
+# ### Guardar Columnas de modelos de h2o
+
+# In[ ]:
+
+
+cols_mod1 = set(["comuna_gls", "sucursal_gls",
+"actividad", "detalle_producto", "region_gls", "tipo_transac", "tipo_trabajador", "serie",
+"vigente", "tipo_plan", "tipo_producto", "fechaingreso", "antiguedad", "num_cargas",
+"edad", "num_empleadores", "seg_muerte", "cambio_plan", "costo_final", "precio_base", "factor_riesgo",
+"costo_total", "costo_benef_adic", "pagado", "excesos", "excedentes", "gasto_Ambulatorios",
+"gasto_Hospitalarios", "gasto_Hospitalarios_excl", "gasto_ges", "gasto_caec", "gasto_pharma",
+"recuperacion_gastos", "iva_cotizaciones", "iva_recuperado", "gasto_Licencias", "gasto_Licencias_excl", "cie_complejo",
+"prestacion_amb_compleja", "renta_imponible","gasto_parto"])
+
+cols_mod2 = set(["fechaingreso", "antiguedad", "num_cargas", "vigente", "region_gls", "comuna_gls",
+"sucursal_gls", "edad", "num_empleadores", "actividad", "tipo_trabajador", "tipo_transac", "serie",
+"tipo_plan", "tipo_producto", "detalle_producto", "seg_muerte", "cambio_plan", "costo_final", "precio_base",
+"factor_riesgo", "costo_total", "costo_benef_adic", "pagado", "excesos", "excedentes", "gasto_Ambulatorios",
+"gasto_Hospitalarios", "gasto_Hospitalarios_excl", "gasto_ges", "gasto_caec", "gasto_pharma", "recuperacion_gastos", "iva_cotizaciones",
+"iva_recuperado", "gasto_Licencias", "gasto_Licencias_excl", "cie_complejo", "prestacion_amb_compleja",
+"renta_imponible", "gasto_parto"])
+
+cols_mod3 = set(["fechaingreso", "antiguedad", "num_cargas", "vigente", "region_gls", "comuna_gls",
+"sucursal_gls", "edad", "num_empleadores", "actividad", "tipo_trabajador", "tipo_transac", "serie",
+"tipo_plan", "tipo_producto", "detalle_producto", "seg_muerte", "cambio_plan", "costo_final",
+"precio_base", "factor_riesgo", "costo_total", "costo_benef_adic", "pagado", "excesos", "excedentes",
+"gasto_Ambulatorios", "gasto_Hospitalarios", "gasto_Hospitalarios_excl", "gasto_ges", "gasto_caec", "gasto_pharma",
+"recuperacion_gastos", "iva_cotizaciones", "iva_recuperado", "gasto_Licencias", "gasto_Licencias_excl", "cie_complejo",
+"prestacion_amb_compleja", "renta_imponible", "gasto_parto"])
+
+(pd.DataFrame({'lista_variables': list(cols_mod1.union(cols_mod2).union(cols_mod3))})
+   .to_csv(datos_ltv_folder + "nombres_variables_usadas_por_ltv"))
+
+print("Ok")
+
+
+# ## Correr update de LTV
+
+# ### H2O Cargamos las tablas
+
+# In[ ]:
+
+
+h2o.init(port=54321, min_mem_size = 15, max_mem_size = 25)
+h2o.remove_all()
+
+
+# In[ ]:
+
+
+nombre_base
+
+
+# In[ ]:
+
+
+data_ltv_snow.head()
+
+
+# In[ ]:
+
+
+# data_ltv2_old = pd.read_csv(datos_ltv_folder + '22.01.18_LTV_202112_dic21.csv.zip', sep=';', compression='zip').rename(columns = lambda x: x.lower()).rename(columns={'categoria_gls': 'categor__a_gls'})
+data_ltv2 = data_ltv_snow.rename(columns = lambda x: x.lower()).rename(columns={'categoria_gls': 'categor__a_gls'})
+drop = ['agencia_vn', 'agente_vn', 'clasif_morosidad',
+       'clasif_riesgo', 'costo_final_mva_1to6m', 'per', 'periodo_anual',
+       'periodo_ult_vig', 'rut', 'rut_titular']
+data_ltv2.drop(columns=drop, inplace=True)
+data_ltv2.head()
+
+
+# In[ ]:
+
+
+# mapeo_col
+
+mapeo_col = {'detalle_producto': 'detalle_producto',
+ 'id_titular': 'id_titular',
+ 'gasto_caec': 'gasto_caec',
+ 'region_gls': 'region_gls',
+ 'anno': 'anno',
+ 'actividad': 'actividad',
+ 'costo_total': 'costo_total',
+ 'benef_adic': 'costo_benef_adic',
+ 'seg_muerte': 'seg_muerte',
+ 'gasto_parto': 'gasto_parto',
+ 'fechaingreso': 'fechaingreso',
+ 'categoria_cod': 'categoria_cod',
+ 'recuperacion_gastos': 'recuperacion_gastos',
+ 'excesos': 'excesos',
+ 'linea_plan': 'linea_plan',
+ 'factor_riesgo': 'factor_riesgo',
+ 'tipo_plan': 'tipo_plan',
+ 'gasto_ges': 'gasto_ges',
+ 'contrato': 'contrato',
+ 'categor__a_gls': 'categor__a_gls',
+ 'cie_complejo': 'cie_complejo',
+ 'centrocostos_cod': 'centrocostos_cod',
+ 'edad': 'edad',
+ 'cambio_plan': 'cambio_plan',
+ 'gasto_hospitalarios': 'gasto_Hospitalarios',
+ 'tipo_transac': 'tipo_transac',
+ 'iva_recuperado': 'iva_recuperado',
+ 'gasto_pharma': 'gasto_pharma',
+ 'sucursal_gls': 'sucursal_gls',
+ 'tipo_producto': 'tipo_producto',
+ 'centro_costo_gls': 'centro_costo_gls',
+ 'precio_base': 'precio_base',
+ 'periodo': 'periodo',
+ 'antiguedad': 'antiguedad',
+ 'fecha_nacimiento': 'fecha_nacimiento',
+ 'vigente': 'vigente',
+ 'gasto_hospitalarios_excl': 'gasto_Hospitalarios_excl',
+ 'iva_cotizaciones': 'iva_cotizaciones',
+ 'region_cod': 'region_cod',
+ 'valor_uf': 'valor_uf',
+ 'comuna_gls': 'comuna_gls',
+ 'excedentes': 'excedentes',
+ 'mes': 'mes',
+ 'gasto_licencias': 'gasto_Licencias',
+ 'gasto_licencias_excl': 'gasto_Licencias_excl',
+ 'gasto_ambulatorios': 'gasto_Ambulatorios',
+ 'tipo_trabajador': 'tipo_trabajador',
+ 'comuna_cod': 'comuna_cod',
+ 'num_empleadores': 'num_empleadores',
+ 'correlativo': 'correlativo',
+ 'sucursal_cod': 'sucursal_cod',
+ 'pagado': 'pagado',
+ 'costo_final': 'costo_final',
+ 'prestacion_amb_compleja': 'prestacion_amb_compleja',
+ 'serie': 'serie',
+ 'renta_imponible': 'renta_imponible',
+ 'sexo': 'sexo',
+ 'num_cargas': 'num_cargas',
+ 'costo_total_mva_1to6m': 'Costo_Total_mva_1to6m',
+ 'precio_base_mva_1to6m': 'precio_base_mva_1to6m',
+ 'excesos_mva_1to6m': 'Excesos_mva_1to6m',
+ 'excedentes_mva_1to6m': 'Excedentes_mva_1to6m',
+ 'factor_riesgo_mva_1to6m': 'factor_riesgo_mva_1to6m',
+ 'iva_recuperado_mva_1to6m': 'iva_recuperado_mva_1to6m',
+ 'iva_cotizaciones_mva_1to6m': 'iva_cotizaciones_mva_1to6m',
+ 'recuperacion_gastos_mva_1to6m': 'recuperacion_gastos_mva_1to6m',
+ 'gasto_ambulatorios_mva_1to6m': 'gasto_Ambulatorios_mva_1to6m',
+ 'gasto_caec_mva_1to6m': 'Gasto_Caec_mva_1to6m',
+ 'gasto_ges_mva_1to6m': 'Gasto_Ges_mva_1to6m',
+ 'gasto_hospitalarios_mva_1to6m': 'gasto_Hospitalarios_mva_1to6m',
+ 'gasto_hospitalarios_excl_mva_1to6m': 'gasto_Hospitalarios_Excl_mva_1to6m',
+ 'gasto_licencias_mva_1to6m': 'gasto_Licencias_mva_1to6m',
+ 'gasto_licencias_excl_mva_1to6m': 'gasto_Licencias_Excl_mva_1to6m',
+ 'gasto_pharma_mva_1to6m': 'gasto_pharma_mva_1to6m',
+ 'gasto_parto_mva_1to6m': 'Gasto_Parto_mva_1to6m',
+ 'renta_imponible_mva_1to6m': 'renta_imponible_mva_1to6m',
+ 'costos_mva_1to6m': 'Costos_mva_1to6m',
+ 'ingresos_mva_1to6m': 'Ingresos_mva_1to6m',
+ 'margen_mva_1to6m': 'Margen_mva_1to6m',
+ 'cie_complejo_mva_1to6m': 'cie_complejo_mva_1to6m',
+ 'prestacion_amb_compleja_mva_1to6m': 'prestacion_amb_compleja_mva_1to6m',
+ 'costo_total_mva_7to12m': 'Costo_Total_mva_7to12m',
+ 'precio_base_mva_7to12m': 'precio_base_mva_7to12m',
+ 'excesos_mva_7to12m': 'Excesos_mva_7to12m',
+ 'excedentes_mva_7to12m': 'Excedentes_mva_7to12m',
+ 'factor_riesgo_mva_7to12m': 'factor_riesgo_mva_7to12m',
+ 'iva_recuperado_mva_7to12m': 'iva_recuperado_mva_7to12m',
+ 'iva_cotizaciones_mva_7to12m': 'iva_cotizaciones_mva_7to12m',
+ 'recuperacion_gastos_mva_7to12m': 'recuperacion_gastos_mva_7to12m',
+ 'gasto_ambulatorios_mva_7to12m': 'gasto_Ambulatorios_mva_7to12m',
+ 'gasto_caec_mva_7to12m': 'Gasto_Caec_mva_7to12m',
+ 'gasto_ges_mva_7to12m': 'Gasto_Ges_mva_7to12m',
+ 'gasto_hospitalarios_mva_7to12m': 'gasto_Hospitalarios_mva_7to12m',
+ 'gasto_hospitalarios_excl_mva_7to12m': 'gasto_Hospitalarios_Excl_mva_7to12m',
+ 'gasto_licencias_mva_7to12m': 'gasto_Licencias_mva_7to12m',
+ 'gasto_licencias_excl_mva_7to12m': 'gasto_Licencias_Excl_mva_7to12m',
+ 'gasto_pharma_mva_7to12m': 'gasto_pharma_mva_7to12m',
+ 'gasto_parto_mva_7to12m': 'Gasto_Parto_mva_7to12m',
+ 'renta_imponible_mva_7to12m': 'renta_imponible_mva_7to12m',
+ 'costos_mva_7to12m': 'Costos_mva_7to12m',
+ 'ingresos_mva_7to12m': 'Ingresos_mva_7to12m',
+ 'margen_mva_7to12m': 'Margen_mva_7to12m',
+ 'cie_complejo_mva_7to12m': 'cie_complejo_mva_7to12m',
+ 'prestacion_amb_compleja_mva_7to12m': 'prestacion_amb_compleja_mva_7to12m',
+ 'costo_total_mva_13to24m': 'Costo_Total_mva_13to24m',
+ 'precio_base_mva_13to24m': 'precio_base_mva_13to24m',
+ 'excesos_mva_13to24m': 'Excesos_mva_13to24m',
+ 'excedentes_mva_13to24m': 'Excedentes_mva_13to24m',
+ 'factor_riesgo_mva_13to24m': 'factor_riesgo_mva_13to24m',
+ 'iva_recuperado_mva_13to24m': 'iva_recuperado_mva_13to24m',
+ 'iva_cotizaciones_mva_13to24m': 'iva_cotizaciones_mva_13to24m',
+ 'recuperacion_gastos_mva_13to24m': 'recuperacion_gastos_mva_13to24m',
+ 'gasto_ambulatorios_mva_13to24m': 'gasto_Ambulatorios_mva_13to24m',
+ 'gasto_caec_mva_13to24m': 'Gasto_Caec_mva_13to24m',
+ 'gasto_ges_mva_13to24m': 'Gasto_Ges_mva_13to24m',
+ 'gasto_hospitalarios_mva_13to24m': 'gasto_Hospitalarios_mva_13to24m',
+ 'gasto_hospitalarios_excl_mva_13to24m': 'gasto_Hospitalarios_Excl_mva_13to24m',
+ 'gasto_licencias_mva_13to24m': 'gasto_Licencias_mva_13to24m',
+ 'gasto_licencias_excl_mva_13to24m': 'gasto_Licencias_Excl_mva_13to24m',
+ 'gasto_pharma_mva_13to24m': 'gasto_pharma_mva_13to24m',
+ 'gasto_parto_mva_13to24m': 'Gasto_Parto_mva_13to24m',
+ 'renta_imponible_mva_13to24m': 'renta_imponible_mva_13to24m',
+ 'costos_mva_13to24m': 'Costos_mva_13to24m',
+ 'ingresos_mva_13to24m': 'Ingresos_mva_13to24m',
+ 'margen_mva_13to24m': 'Margen_mva_13to24m',
+ 'cie_complejo_mva_13to24m': 'cie_complejo_mva_13to24m',
+ 'prestacion_amb_compleja_mva_13to24m': 'prestacion_amb_compleja_mva_13to24m',
+ 'costos_sum_future_1y': 'Costos_sum_future_1y',
+ 'ingresos_sum_future_1y': 'Ingresos_sum_future_1y',
+ 'margen_sum_future_1y': 'Margen_sum_future_1y',
+ 'costos_avg_future_1y': 'Costos_avg_future_1y',
+ 'ingresos_avg_future_1y': 'Ingresos_avg_future_1y',
+ 'margen_avg_future_1y': 'Margen_avg_future_1y',
+ 'costos_sum_future_2y': 'Costos_sum_future_2y',
+ 'ingresos_sum_future_2y': 'Ingresos_sum_future_2y',
+ 'margen_sum_future_2y': 'Margen_sum_future_2y',
+ 'costos_avg_future_2y': 'Costos_avg_future_2y',
+ 'ingresos_avg_future_2y': 'Ingresos_avg_future_2y',
+ 'margen_avg_future_2y': 'Margen_avg_future_2y',
+ 'costos_sum_future_3y': 'Costos_sum_future_3y',
+ 'ingresos_sum_future_3y': 'Ingresos_sum_future_3y',
+ 'margen_sum_future_3y': 'Margen_sum_future_3y',
+ 'costos_avg_future_3y': 'Costos_avg_future_3y',
+ 'ingresos_avg_future_3y': 'Ingresos_avg_future_3y',
+ 'margen_avg_future_3y': 'Margen_avg_future_3y'}
+
+# for col in data_ltv2.columns:
+#     for col2 in data_ltv.columns:
+#         if col.lower() == col2.lower():
+#             mapeo_col[col] = col2
+            
+#mapeo_col
+
+
+# In[ ]:
+
+
+data_ltv  = data_ltv2.rename(columns=mapeo_col)
+
+
+# In[ ]:
+
+
+df = data_ltv
+#df.drop(labels=['periodo','ID_PIT'], axis=1, inplace = True)
+#df.rename(columns = {'keyPIT_Date':'periodo'}, inplace = True)
+df['periodo'] = pd.to_datetime(df['periodo'], format ='%Y%m')
+df['fechaingreso'] = pd.to_datetime(df['fechaingreso'])
+
+
+# In[ ]:
+
+
+df.head()
+
+
+# # Arreglamos las categorías con demasiados puntos
+
+# ### Categoria_a
+
+# In[ ]:
+
+
+df['categ_simplificada'] = df['categor__a_gls'].apply(lambda x: (re.findall('^\D+',x)[0]))
+print('Pasamos de tener {} categorías, a tener {} después de simplificar'.format(
+             len(set(df['categor__a_gls'])),len(set(df['categ_simplificada']))))
+
+
+# ### Linea plan
+
+# In[ ]:
+
+
+df['linea_plan_simplificada'] = df['linea_plan'].apply(lambda x: (re.findall('^\D+',x)[0]) if len(x) > 0 else x)
+print('Pasamos de tener {} categorías, a tener {} después de simplificar'.format(
+len(set(df['linea_plan'])),len(set(df['linea_plan_simplificada']))))
+
+
+# ### Borramos las categorías entonces
+
+# In[ ]:
+
+
+[m for m in df.columns if 'cat' in m]
+df.drop(labels = ['categoria_cod', 'categor__a_gls','linea_plan'], axis = 1, inplace = True)
+
+borramos = ['contrato','correlativo','fecha_nacimiento'] + [col for col in df.columns if 'fut' in col]
+df.drop(labels = borramos, axis = 1, inplace = True)
+
+df[[m for m in df.columns if 'cod' in m]].head()
+df.drop(labels = [m for m in df.columns if 'cod' in m], axis = 1, inplace = True)
+
+
+# # Categorizamos el dataframe
+
+# In[ ]:
+
+
+df.head()
+
+
+# In[ ]:
+
+
+categoricals =  ['region_gls', 'comuna_gls', 'sucursal_gls', 'centro_costo_gls', 'vigente', 
+                 'actividad','Tipo_Trab', 'Region_cod', 'tipo_transac', 'serie',
+                 'tipo_plan','tipo_producto',
+                 'detalle_producto','linea_plan_simplificada',
+                 'tipo_trabajador', 'categ_simplificada']
+
+for tipo in df.columns:
+    if tipo in categoricals:
+        df[tipo] = df[tipo].astype('category')
+        
+df.drop(labels=['sexo'], axis=1, inplace=True)
+
+
+# In[ ]:
+
+
+# Acá se hace check de Great Expectations intermedio
+df.to_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv')
+
+with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
+    my_expectations_config = json.load(f)
+
+#El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script    
+
+my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
+
+# Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
+my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
+my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
+my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
+my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
+my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
+
+resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
+
+with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
+    json.dump(resultado, outfile)
+    
+print("Guardado!")
+
+#assert resultado['success']
+
+
+# ### Cargar última versión de los modelos predictivos
+
+# In[ ]:
+
+
+# original spike
+# modelos_ingresos = {}
+# modelos_costos = {}
+# modelos_fuga = {}
+
+# carpeta_models_automl = f"{carpeta_ltv}models/h2o_models/modelsautoml/"
+# print(carpeta_models_automl)
+# modelos_ingresos['1y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/1y/StackedEnsemble_AllModels_0_AutoML_20190103_170253')
+# modelos_ingresos['2y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/2y/StackedEnsemble_AllModels_0_AutoML_20190103_190356')
+# modelos_ingresos['3y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/3y/StackedEnsemble_AllModels_0_AutoML_20190103_210454')
+
+# modelos_costos['1y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/1y/StackedEnsemble_AllModels_0_AutoML_20190103_170925')
+# modelos_costos['2y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/2y/StackedEnsemble_AllModels_0_AutoML_20190103_191041')
+# modelos_costos['3y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/3y/StackedEnsemble_AllModels_0_AutoML_20190103_211140')
+
+# modelos_fuga['1y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y1/StackedEnsemble_AllModels_0_AutoML_20181211_175510')
+# modelos_fuga['2y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y2/StackedEnsemble_AllModels_0_AutoML_20181211_195722')
+# modelos_fuga['3y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y3/StackedEnsemble_AllModels_0_AutoML_20181211_215935')
+
+
+# In[ ]:
+
+
+modelos_ingresos = {}
+modelos_costos = {}
+modelos_fuga = {}
+keys = {'1y', '2y','3y'}
+folders = {'fuga', 'costos', 'ingresos'}
+carpeta_models_automl = f"{carpeta_ltv}models/h2o_models/modelsautoml/"
+print(carpeta_models_automl)
+
+for folder in folders:
+    for key in keys:
+        print(folder + ' - ' + key)
+        if folder == 'ingresos':
+            modelos_ingresos[key] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/'+key+'/retrain_ltv_ingresos_' + key)
+        elif folder == 'costos':
+            modelos_costos[key] = h2o.load_model(f'{carpeta_models_automl}costos_avg/' +key+'/retrain_ltv_costos_' + key)
+        else:
+            modelos_fuga[key] = h2o.load_model(f'{carpeta_models_automl}fuga/' +key[1]+key[0]+'/retrain_ltv_fuga_' + key[1]+key[0])
+
+# modelos_ingresos['1y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/1y/StackedEnsemble_AllModels_0_AutoML_20190103_170253')
+# modelos_ingresos['2y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/2y/StackedEnsemble_AllModels_0_AutoML_20190103_190356')
+# modelos_ingresos['3y'] = h2o.load_model(f'{carpeta_model_automl}ingresos_avg/3y/StackedEnsemble_AllModels_0_AutoML_20190103_210454')
+
+# modelos_costos['1y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/1y/StackedEnsemble_AllModels_0_AutoML_20190103_170925')
+# modelos_costos['2y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/2y/StackedEnsemble_AllModels_0_AutoML_20190103_191041')
+# modelos_costos['3y'] = h2o.load_model(f'{carpeta_models_automl}costos_avg/3y/StackedEnsemble_AllModels_0_AutoML_20190103_211140')
+
+# modelos_fuga['1y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y1/StackedEnsemble_AllModels_0_AutoML_20181211_175510')
+# modelos_fuga['2y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y2/StackedEnsemble_AllModels_0_AutoML_20181211_195722')
+# modelos_fuga['3y'] = h2o.load_model(f'{carpeta_models_automl}fuga/y3/StackedEnsemble_AllModels_0_AutoML_20181211_215935')
+
+
+# ### Generamos el h2o frame
+
+# In[ ]:
+
+
+h2o.__version__
+
+
+# In[ ]:
+
+
+mva_col_types = {col:'numeric' for col in df.columns if 'mva_' in col}
+df_h2o = h2o.H2OFrame(df, destination_frame='dataframe_con_todo', column_types=mva_col_types)
+
+
+# In[ ]:
+
+
+df_h2o.head()
+
+
+# ### Predecimos
+
+# In[ ]:
+
+
+df_h2o.columns
+
+
+# In[ ]:
+
+
+for key in modelos_ingresos:
+    df_h2o['prediccion_percentil_ingresos_'+key] = modelos_ingresos[key].predict(df_h2o)
+for key in modelos_costos:
+    df_h2o['prediccion_percentil_costos_'+key] = modelos_costos[key].predict(df_h2o)
+for key in modelos_fuga:
+    df_h2o['prediccion_probabilidad_fuga_'+key] = modelos_fuga[key].predict(df_h2o)['p1']
+
+
+# # Actualizar distribuciones 
+
+# Dejar los percentiles entre 0 y 1
+
+# In[ ]:
+
+
+for key in modelos_ingresos:
+    print(key)
+    df_h2o[df_h2o['prediccion_percentil_ingresos_'+key] < 0, 'prediccion_percentil_ingresos_'+key] = 0
+    df_h2o[df_h2o['prediccion_percentil_costos_'+key] < 0, 'prediccion_percentil_costos_'+key] = 0
+
+    df_h2o[df_h2o['prediccion_percentil_ingresos_'+key] > 1, 'prediccion_percentil_ingresos_'+key] = 1
+    df_h2o[df_h2o['prediccion_percentil_costos_'+key] > 1, 'prediccion_percentil_costos_'+key] = 1
+
+
+# In[ ]:
+
+
+df_h2o[[m for m in df_h2o.columns if 'perc' in m]].head(5)
+
+
+# In[ ]:
+
+
+df = df_h2o.as_data_frame()
+
+df['Margen_t'] = 6*df['Margen_mva_1to6m'] + 6*df['Margen_mva_7to12m']
+df['Margen_t-1'] = 12*df['Margen_mva_13to24m'] 
+
+df['Costos_t'] = 6*df['Costos_mva_1to6m'] + 6*df['Costos_mva_7to12m']
+df['Costos_t-1'] = 12*df['Costos_mva_13to24m'] 
+
+df['Ingresos_t'] = 6*df['Ingresos_mva_1to6m'] + 6*df['Ingresos_mva_7to12m']
+df['Ingresos_t-1'] = 12*df['Ingresos_mva_13to24m'] 
+
+#ESTE TARDA MUCHO
+
+
+# Le agregamos el percentil al que pertenecen:
+
+# In[ ]:
+
+
+columnas_a_transformar = ['Costos_t-1','Costos_t','Ingresos_t-1','Ingresos_t']
+
+qtransformer = QuantileTransformer(100) #De nuevo seed?
+
+for col in columnas_a_transformar:
+    #df[col].fillna(0, inplace=True)
+    qtransformer.fit(df[col].dropna().values.reshape(-1, 1))
+    df['perc_' + col] = qtransformer.transform(df[col].values.reshape(-1, 1)).flatten()
+
+
+df.head(2)
+
+
+# In[ ]:
+
+
+df.perc_Costos_t.agg(['min','max', 'std'])
+
+
+# In[ ]:
+
+
+def calcular_transformacion(df, ano1='Margen_t-1', ano2='Margen_t'):
+    """
+    Calcula el delta (cambio en $) por percentil entre dos distribuciones
+    """
+    perc_ano1 = 'perc_'+ano1
+    perc_ano2 = 'perc_'+ano2
+    
+    delta = {}
+    candidatos_ano1 = {}
+    candidatos_ano2 = {}
+    candidatos = {}
+    num_candidatos = {}
+    for i in np.linspace(0, 1, 101):
+        i_round = np.round(i, 2)
+        #Identifica filas que están en el grupo i (+- 4 percentiles)
+        candidatos_ano1[i] = ((df[perc_ano1].round(decimals=2) >= (i_round - 0.02)) &  (df[perc_ano1].round(decimals = 2) <= (i_round + 0.02)))
+                                     
+        candidatos_ano2[i] = ((df[perc_ano2].round(decimals=2) >= (i_round - 0.02)) & (df[perc_ano2].round(decimals=2) <=(i_round + 0.02)))
+                                     
+        
+        #Cumplieron estar en ese grupo de percentil dos años seguidos
+        candidatos[i] = candidatos_ano1[i] & candidatos_ano2[i]
+        num_candidatos[i] = candidatos[i].sum()
+        if num_candidatos[i] == 0:
+            delta[i] = 0
+        if num_candidatos[i] > 0:
+            #Delta promedio (en $) de margen de gente que no cambió (casi) su percentil
+            delta[i] = (df[candidatos[i]][ano2] - df[candidatos[i]][ano1]).mean()
+    return delta#, num_candidatos
+
+
+# In[ ]:
+
+
+
+@njit(parallel=True)
+def par_nb_transformar_distribucion(costos_o_ingresos_ano1_array, predicted_percentiles: np.array, keys_delta: np.array, values_delta: np.array, num_anos=1):
+    """
+    Calcula el valor correspondiente al percentil p del siguiente año.
+    ValueNextYear[percentil] = VPrevYear[percentil] + num_años*delta[percentil]
+    
+    p: percentil predicho de ingresos o costos (tomado de, p ej, 'prediccion_percentil_costos_1y')
+    delta: diccionario de diferencias promedio por percentil
+    costos_o_ingresos_ano1_array: array de 'Costos_t-1', 'Ingresos_t-1', 'Margen_t-1'
+    """
+    value_next_year = np.empty_like(costos_o_ingresos_ano1_array)
+    
+    for i in prange(predicted_percentiles.shape[0]):
+        p = predicted_percentiles[i]
+        value_prev_year = np.percentile(costos_o_ingresos_ano1_array[~np.isnan(costos_o_ingresos_ano1_array)], 100*p) #interpolation='midpoint'
+        #Identifico el value delta más cercano a p
+        nearest_perc_index = np.abs(keys_delta - p).argmin()
+        value_next_year[i] = value_prev_year + num_anos*values_delta[nearest_perc_index]
+    return value_next_year
+
+
+# ## Percentiles Costos del Futuro
+
+# In[ ]:
+
+
+#Transformar percentiles predicho a pesos ($) (costos)
+ano1 = 'Costos_t-1'
+ano2 = 'Costos_t'
+
+delta = calcular_transformacion(df, ano1=ano1, ano2=ano2)
+
+
+# ## FOR LOOP para los tres costos con numba parallel
+
+# In[ ]:
+
+
+keys_delta, values_delta = np.array(list(delta.keys())), np.array(list(delta.values()))
+costos_o_ingresos_ano1_array = df['Costos_t-1'].values #.copy()
+
+opciones = ['prediccion_percentil_costos_1y', 'prediccion_percentil_costos_2y',
+            'prediccion_percentil_costos_3y']
+num=1
+for m in opciones:
+    predicted_percentiles = df[m].values #.copy()
+    df['predicted_Costos_t+'+str(num)] = par_nb_transformar_distribucion(costos_o_ingresos_ano1_array, predicted_percentiles, 
+                                                keys_delta, values_delta, num_anos=num)
+    num+=1
+
+
+# ## Percentiles Ingresos del Futuro
+
+# In[ ]:
+
+
+#Transformar percentile predicho a $pesos (ingresos)
+ano1 = 'Ingresos_t-1'
+ano2 = 'Ingresos_t'
+
+delta = calcular_transformacion(df, ano1=ano1, ano2=ano2)
+
+
+# ## FOR LOOP para los tres ingresos con numba parallel
+
+# In[ ]:
+
+
+keys_delta, values_delta = np.array(list(delta.keys())), np.array(list(delta.values()))
+costos_o_ingresos_ano1_array = df['Ingresos_t-1'].values #.copy()
+
+opciones = ['prediccion_percentil_ingresos_1y', 'prediccion_percentil_ingresos_2y',
+            'prediccion_percentil_ingresos_3y']
+num=1
+for m in opciones:
+    predicted_percentiles = df[m].values #.copy()
+    df['predicted_Ingresos_t+'+str(num)] = par_nb_transformar_distribucion(costos_o_ingresos_ano1_array, predicted_percentiles, 
+                                                keys_delta, values_delta, num_anos=num)
+    num+=1
+
+
+# In[ ]:
+
+
+pd.set_option('display.max_columns', 500)
+df.head(2)
+
+
+# In[ ]:
+
+
+#Export y subir a BigQuery
+# ES necesario pasar por H2o?
+# 
+# h2o_df = h2o.H2OFrame(df)
+csv_name = f'{carpeta_ltv}Output/output_modelos_avg_{nombre_fancy}.csv'
+# h2o.export_file(h2o_df,
+#                 csv_name,
+#                 force=True, parts=1)
+df.to_csv(csv_name)
+ltv_table_name = f"LTV.PREDICCION_MODULOS_LTV_{nombre_fancy}"
+# !bq --location=US load --autodetect --source_format=CSV {ltv_table_name} "{csv_name}"
+
+
+# ### Creamos la tabla de LTV:
+
+# In[ ]:
+
+
+#Liberamos memoria de los procesos de h2o
+h2o.remove_all()
+h2o.shutdown()
+h2o.init(port=54321, min_mem_size='20g')
+
+
+# In[ ]:
+
+
+df_ltv = df[[m for m in df.columns if 'predicted' in m or 'probabilidad' in m or 'id_' in m or 'prediccion_percentil' in m]].copy()
+df_ltv.head()
+
+
+# In[ ]:
+
+
+df_ltv = df[[m for m in df.columns if 'predicted' in m or 'probabilidad' in m or 'id_' in m or 'prediccion_percentil' in m]].copy()
+df_ltv.set_index('id_titular', inplace = True)
+#df_ltv.drop_duplicates(subset='id_titular', inplace = True)
+df_ltv = df_ltv[~df_ltv.index.duplicated(keep='first')]
+
+df_ltv.head(3)
+
+
+# In[ ]:
+
+
+df_ltv.describe()
+
+
+# In[ ]:
+
+
+def calculo_ltv(df, cols_margen, cols_fuga, r=0.1):
+    """
+    Toma un df con columnas predichas de margen, columnas predichas de fuga
+    y calcula el LTV con una tasa de descuento r
+    
+    df: dataframe con la info necesaria: columnas de margen y columnas de fuga.
+    cols_margen: lista de las columnas usadas de margen.
+    cols_fuga: lista de las columnas usadas de probabilidad de fuga. Deben ir en el 
+                mismo orden que cols_margen.
+    r: tasa de descuento.
+    
+    returns:
+        Devuelve un datatrace con el mismo índice que df, con el LTV predicho para cada ID.
+    
+    """
+    def desc(r, periodo):
+        return 1/(1+r)**(periodo+1)
+    
+    LTV_predicted = pd.DataFrame(0,index = df.index, columns = ['LTV_predicted'])
+    
+    # Importante, suponemos que vienen ordenadas las listas:
+    
+    for i in np.arange(0,len(cols_margen)):
+        LTV_predicted['LTV_predicted'] += desc(r, i)*df[cols_margen[i]]*(1 - df[cols_fuga[i]])
+    
+    return LTV_predicted
+
+
+def calculo_ltv_fuga0(df, cols_margen, r=0.1):
+    """
+    Toma un df con columnas predichas de margen, columnas predichas de fuga
+    y calcula el LTV con una tasa de descuento r
+    
+    df: dataframe con la info necesaria: columnas de margen y columnas de fuga.
+    cols_margen: lista de las columnas usadas de margen.
+    cols_fuga: lista de las columnas usadas de probabilidad de fuga. Deben ir en el 
+                mismo orden que cols_margen.
+    r: tasa de descuento.
+    
+    returns:
+        Devuelve un datatrace con el mismo índice que df, con el LTV predicho para cada ID.
+    
+    """
+    def desc(r, periodo):
+        return 1/(1+r)**(periodo+1)
+    
+    LTV_predicted = pd.DataFrame(0,index = df.index, columns = ['LTV_predicted'])
+    
+    # Importante, suponemos que vienen ordenadas las listas:
+    for i in np.arange(0, len(cols_margen)):
+        LTV_predicted['LTV_predicted'] += desc(r, i)*df[cols_margen[i]]
+    return LTV_predicted
+
+
+# In[ ]:
+
+
+df_ltv['predicted_Margen_t+1'] = df_ltv['predicted_Ingresos_t+1'] - df_ltv['predicted_Costos_t+1']
+df_ltv['predicted_Margen_t+2'] = df_ltv['predicted_Ingresos_t+2'] - df_ltv['predicted_Costos_t+2']
+df_ltv['predicted_Margen_t+3'] = df_ltv['predicted_Ingresos_t+3'] - df_ltv['predicted_Costos_t+3']
+
+cols_margen = ['predicted_Margen_t+1', 'predicted_Margen_t+2', 'predicted_Margen_t+3']
+cols_fuga = ['prediccion_probabilidad_fuga_1y', 'prediccion_probabilidad_fuga_2y', 'prediccion_probabilidad_fuga_3y']
+
+ltv = calculo_ltv(df_ltv, cols_margen, cols_fuga)
+ltv_fuga0 = calculo_ltv_fuga0(df_ltv, cols_margen)
+
+
+# In[ ]:
+
+
+quant_dict_nueva = {}
+for column in [m for m in df_ltv.columns if 'predicted_Margen' in m]:
+    df_ltv[column + '_perc'] = np.nan
+    quant_dict_nueva[column + '_perc'] = QuantileTransformer(100) #seed?
+    df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
+        (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
+
+df_ltv.head(3)
+
+
+# In[ ]:
+
+
+df_ltv['ltv_predicted'] = ltv['LTV_predicted']
+df_ltv['ltv_fuga0_predicted'] = ltv_fuga0['LTV_predicted']
+#LTV en percentiles
+
+quant_dict_ltv = {}
+for column in [m for m in df_ltv.columns if 'ltv' in m]:
+    df_ltv[column + '_perc'] = np.nan
+    quant_dict_nueva[column + '_perc'] = QuantileTransformer(100)
+    df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
+        (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
+
+df_ltv.head(3)
+
+
+# In[ ]:
+
+
+df_ltv.reset_index(inplace=True)
+df_ltv.head(3)
+
+
+# In[ ]:
+
+
+df_ltv.describe()
+
+
+# In[ ]:
+
+
+import requests
+
+def slack_code_ready(message, username, webhook_num):
+    """
+    Sends a message to a username on slack
+    """
+    webhook = "https://hooks.slack.com/services/" + webhook_num
+    message = "<@U{0}> {1}".format(username, message)
+    payload = {"text": message}
+    headers = {'Content-type': 'application/json'}
+
+    return requests.post(url=webhook, data=json.dumps(payload), headers=headers)
+
+username =  "6FK1CFBJ" 
+webhook = "T6FJW727J/BBY4DLYGP/whY7uk7I6DRJ53VWUJrSYtXp"
+
+
+#slack_code_ready(f"""Ya terminó la parte de df_ltv. Ahora paso a df_p""",
+ #                username, webhook)
+
+
+# ## Le agregamos el cluster al que pertenece:
+
+# In[ ]:
+
+
+df_p = pd.DataFrame()
+df_p['promedio_ingresos'] = df_ltv[['predicted_Ingresos_t+3','predicted_Ingresos_t+2','predicted_Ingresos_t+1']].mean(axis =1)
+df_p['promedio_costos'] = df_ltv[['predicted_Costos_t+3','predicted_Costos_t+2','predicted_Costos_t+1']].mean(axis =1)
+df_p['promedio_fuga'] = df_ltv[['prediccion_probabilidad_fuga_1y','prediccion_probabilidad_fuga_2y','prediccion_probabilidad_fuga_3y']].mean(axis =1)
+df_p['ltv_predicted'] = df_ltv[['ltv_predicted']]
+df_p['ltv_fuga0_predicted'] = df_ltv[['ltv_fuga0_predicted']]
+
+df_p['id_titular'] = df_ltv[['id_titular']]
+
+df_p.head(2)
+
+
+# In[ ]:
+
+
+df_p.to_csv("../../df_p.csv")
+
+
+# In[ ]:
+
+
+import gc
+h2o.cluster().shutdown()
+del df_p
+time.sleep(15)
+gc.collect()
+time.sleep(25)
+
+
+# In[ ]:
+
+
+# De nuevo para asegurarse de que la memoria esté disponible
+h2o.init(port=54321, min_mem_size='20g')
+h2o.remove_all()
+
+model = h2o.load_model(path=f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5')
+df_ltv.reset_index(inplace = True)
+
+
+# In[ ]:
+
+
+df_p_h2o = h2o.import_file(path='../../df_p.csv', destination_frame="dp_p")
+cluster_predicted = model.predict(df_p_h2o).as_data_frame() + 1
+
+diccionario_clusters_LTV = {5: 'muy alto', 1: 'alto', 3:'medio', 2:'bajo',
+                            4:'muy bajo (alta fuga)'}
+
+
+# In[ ]:
+
+
+df_ltv['categoria_ltv'] = cluster_predicted.replace(diccionario_clusters_LTV)
+df_ltv.head(2)
+
+
+# In[ ]:
+
+
+nombre_fancy
+
+
+# In[ ]:
+
+
+csv_name = f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv'
+#df_ltv.to_pickle(f'/home/ubuntu/spike/LTV3/Output/prediccion_ltv_con_categoria_{fancy_name}.pkl')
+df_ltv.to_csv(csv_name, index = False)
+
+ltv_table_name = f"LTV.PREDICCION_LTV_CATLTV_{nombre_fancy}"
+#!bq --location=US load --autodetect --replace --source_format=CSV {ltv_table_name} "{csv_name}"
+
+
+# In[ ]:
+
+
+df_ltv.head()
+
+
+# In[ ]:
+
+
+end = time.time()
+
+tiempo_transcurrido = (end - start)/60
+
+
+# In[ ]:
+
+
+## Acá se hace check de Great Expectations final (output)
+
+with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
+    my_expectations_config = json.load(f)
+
+my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
+                    
+resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
+
+with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
+          'w') as outfile:
+    json.dump(resultado_output, outfile)
+
+print("Guardado!")
+
+#assert resultado_output['success']
+
+
+# In[ ]:
+
+
+import requests
+def slack_code_ready(message, username, webhook_num):
+    """
+    Sends a message to a username on slack
+    """
+    webhook = "https://hooks.slack.com/services/" + webhook_num
+    message = "<@U{0}> {1}".format(username, message)
+    payload = {"text": message}
+    headers = {'Content-type': 'application/json'}
+
+    return requests.post(url=webhook, data=json.dumps(payload), headers=headers)
+
+username =  "J2R9275K" #Emi. CD: "6FK1CFBJ"
+webhook = "T6FJW727J/BBY4DLYGP/whY7uk7I6DRJ53VWUJrSYtXp"
+
+
+#slack_code_ready(f"""Terminó la predicción de LTV para {nombre_fancy}.
+ #                 Bien, no? Anda a LTV.PREDICCION_LTV_CATLTV_{nombre_fancy}
+  #                  a cachar si se ve gonito.
+  #                  Se demoró {tiempo_transcurrido} mins \X|C/ """,
+  #               username, webhook)
+
+
+# In[ ]:
+
+
+print(tiempo_transcurrido)
+print(tiempo_transcurrido/60)
+
+
+# In[ ]:
+
+
+for col in df_ltv.columns:
+    if df_ltv[col].isna().any():
+        print(f'{col} tiene {df_ltv[col].isna().sum()} vacios')
+
+
+# In[ ]:
+
+
+data_ltv.shape, df_ltv.shape
+
+
+# In[ ]:
+
+
+df_ltv.head()
+
+
+# In[ ]:
+
+
+df_ltv.describe()
+
+
+# In[ ]:
+
+
+df_ltv.ltv_fuga0_predicted.describe()
+
