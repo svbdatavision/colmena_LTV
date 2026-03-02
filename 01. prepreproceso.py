@@ -7,10 +7,6 @@
 # In[1]:
 
 
-get_ipython().run_line_magic('matplotlib', 'inline')
-get_ipython().run_line_magic('load_ext', 'autoreload')
-get_ipython().run_line_magic('autoreload', '2')
-
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
@@ -23,6 +19,7 @@ from tqdm import tqdm_notebook as progress_bar
 from difflib import SequenceMatcher
 from itertools import combinations
 import os
+from pathlib import Path
 
 # sys.path.append('../../src')
 # from comparar_distribuciones import *
@@ -30,10 +27,77 @@ import os
 # sys.path.append("../../../spike")
 # import SpikePy as sp
 
-import snowflake.connector as snow
 import getpass as gp
 
-from sqlalchemy import create_engine
+try:
+    import snowflake.connector as snow
+except Exception:
+    snow = None
+
+try:
+    from sqlalchemy import create_engine
+except Exception:
+    create_engine = None
+
+
+def _run_ipython_magic(name, value):
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+        if ip is not None:
+            ip.run_line_magic(name, value)
+    except Exception:
+        pass
+
+
+def _get_spark_session():
+    try:
+        return spark  # type: ignore[name-defined]
+    except Exception:
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession.getActiveSession()
+        except Exception:
+            return None
+
+
+def _normalize_local_path(path_value):
+    if path_value.startswith("dbfs:/"):
+        return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
+    return path_value
+
+
+def _get_secret(scope, key):
+    if not scope or not key:
+        return None
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+    except Exception:
+        return None
+
+
+def _get_credential(env_name, prompt_label):
+    value = os.getenv(env_name)
+    if value:
+        return value
+
+    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
+    secret_key = os.getenv(f"{env_name}_KEY")
+    secret_value = _get_secret(secret_scope, secret_key)
+    if secret_value:
+        return secret_value
+
+    if sys.stdin and sys.stdin.isatty():
+        return gp.getpass(prompt=prompt_label)
+
+    raise RuntimeError(
+        f"No se encontro {env_name}. Configura variable de entorno o secreto de Databricks."
+    )
+
+
+_run_ipython_magic('matplotlib', 'inline')
+_run_ipython_magic('load_ext', 'autoreload')
+_run_ipython_magic('autoreload', '2')
+
 plt.style.use('fivethirtyeight')
 #Usar kernel spikelabs_env_3
 
@@ -63,35 +127,64 @@ periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
 # In[3]:
 
 
-snow_user = gp.getpass(prompt='Usuario')
-snow_pass = gp.getpass(prompt = 'Password')
+spark_session = _get_spark_session()
+snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 
 
 # In[4]:
 
 
-engine = create_engine(
-    'snowflake://{user}:{password}@{account}/'.format(
-        user=snow_user,
-        password=snow_pass,
-        account='isapre_colmena.us-east-1',
+if spark_session is not None:
+    print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
+    df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
+else:
+    if create_engine is None:
+        raise ImportError(
+            "sqlalchemy no esta disponible. Instalar dependencia o ejecutar en Databricks con Spark."
+        )
+    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario")
+    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password")
+    engine = create_engine(
+        'snowflake://{user}:{password}@{account}/'.format(
+            user=snow_user,
+            password=snow_pass,
+            account=snow_account,
+        )
     )
-)
-try:
-    connection = engine.connect()
-    results = connection.execute('select current_version()').fetchone()
-    print(results[0])
-finally:
-    connection.close()
-    engine.dispose()
+    connection = None
+    try:
+        connection = engine.connect()
+        results = connection.execute('select current_version()').fetchone()
+        print(results[0])
+        df_ges = pd.read_sql('SELECT * FROM EST.P_DDV_EST.JC_GES_PRED;', con=engine)
+    finally:
+        if connection is not None:
+            connection.close()
+        engine.dispose()
 
 
 # In[5]:
 
 
-df_ges = pd.read_sql('SELECT * FROM EST.P_DDV_EST.JC_GES_PRED;', con=engine)
+repo_dir = Path(__file__).resolve().parent
+default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
+disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
+inputs = Path(_normalize_local_path(
+    os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))
+))
+outputs = Path(_normalize_local_path(
+    os.getenv("GES_OUTPUT_DIR", str(repo_dir / "output"))
+))
+in_pred = Path(_normalize_local_path(
+    os.getenv("GES_PREDICCION_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/prediccion")
+))
+
+inputs.mkdir(parents=True, exist_ok=True)
+outputs.mkdir(parents=True, exist_ok=True)
+in_pred.mkdir(parents=True, exist_ok=True)
+
 nombre_archivo = f'{hoy:%y.%m.%d}_GES_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}.gz'
-ges_file = f'./input/preproceso/' + nombre_archivo
+ges_file = inputs / nombre_archivo
 df_ges.to_csv(ges_file, index=False, compression='gzip')
 
 
@@ -121,14 +214,7 @@ else:
 
 
 #todos los archivos necesarios
-disco = '/mnt/disks/modelos/' #al bucket (original): /estudio/data/
-
-inputs = 'input/preproceso/'
-
-outputs = 'output/'
-
-#inputs predicciones
-in_pred = disco+'Proyecto_GES/Prediccion/input/prediccion/'
+# Los directorios ya fueron definidos de forma portable para Databricks.
 
 # print('Buscando los datos de ges del periodo...')
 
@@ -161,7 +247,7 @@ in_pred = disco+'Proyecto_GES/Prediccion/input/prediccion/'
     
 #     print('Modifique más abajo el archivo que desea utilizar')
 
-ges = ges_file
+ges = str(ges_file)
 
 
 # In[8]:
@@ -171,7 +257,7 @@ print('Buscando los datos de ltv del periodo...')
 
 temp_ltv = []
 
-for root, subdirs, files in os.walk(inputs):
+for root, subdirs, files in os.walk(str(inputs)):
      for filename in files:
             if 'ltv' in filename.lower():
                 if periodo in filename:
@@ -188,7 +274,7 @@ try:
 except IndexError:
     print('No hay archivos en el periodo, buscando en todos los periodos...')
 
-    for root, subdirs, files in os.walk('input'):
+    for root, subdirs, files in os.walk(str(inputs.parent)):
          for filename in files:
                 if 'ges' in filename.lower():
                         temp_ltv.append(filename)
@@ -212,7 +298,7 @@ pobreza = 'xlsx/nse_y_pobreza.xlsx'
 
 
 #cargamos datos ltv
-df_ltv =  pd.read_csv(inputs+ltv, sep=",", compression='gzip').rename(columns = lambda x: x.lower())
+df_ltv =  pd.read_csv(inputs / ltv, sep=",", compression='gzip').rename(columns = lambda x: x.lower())
 df_ltv['periodo'] = pd.to_datetime(df_ltv['periodo'], format='%Y%m')
 # df_ltv.head()
 
@@ -300,7 +386,7 @@ categorias = {'alto': alto, 'medio': medio, 'bajo': bajo, 'le': le}
 
 #demora 1 min
 cat = 'xlsx/PRM_Categoria.xlsx'
-categoria = pd.read_excel(inputs+cat)
+categoria = pd.read_excel(inputs / cat)
 df = pd.merge(df, categoria[['cod_categoria', 'preferente']], how='left', 
                  left_on='categoria_cod', right_on='cod_categoria')
 df['cat_linea_plan'] = df.preferente.apply(cat_linea_plan)
@@ -343,13 +429,13 @@ df.preferente = df.preferente.apply(limpiar_preferente)
 
 
 # demora 
-division_reg = (pd.read_excel(inputs+div_reg, skiprows=1)
+division_reg = (pd.read_excel(inputs / div_reg, skiprows=1)
                 [19::].rename(columns={'Unnamed: 3': 'norte_centro_sur'})
                [['COD_REGION', 'GLS_WEB_REGION', 'norte_centro_sur']])
 division_reg['COD_REGION'] = division_reg.COD_REGION.astype('int')
 
-cod_comuna = pd.read_excel(inputs+comunas)
-nse_y_pobreza = pd.read_excel(inputs+pobreza)
+cod_comuna = pd.read_excel(inputs / comunas)
+nse_y_pobreza = pd.read_excel(inputs / pobreza)
 
 nse_y_pobreza = pd.merge(nse_y_pobreza, cod_comuna, how='inner',
                         left_on='COMUNA', right_on='con_comuna_gls')
@@ -456,7 +542,7 @@ datos = pd.merge(df, df_aux, how='left', on=['id_titular', 'periodo'])
 
 f = f'ready_to_pred_{periodo}.csv'
 #df.to_csv(outputs + f) dejo solamente la copia para la predicción, no tiene sentido estar duplicando este archivo
-df.to_csv(in_pred + f) #apunta la carperta de inputs para la predicción
+df.to_csv(in_pred / f) #apunta la carperta de inputs para la predicción
 
 
 # In[32]:

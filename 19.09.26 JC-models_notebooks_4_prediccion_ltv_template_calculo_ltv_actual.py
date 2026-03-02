@@ -25,15 +25,10 @@
 # In[ ]:
 
 
-get_ipython().run_line_magic('load_ext', 'autoreload')
-get_ipython().run_line_magic('autoreload', '2')
-
-
-# In[ ]:
-
-
 import time
 import os
+import sys
+from pathlib import Path
 from numba import njit, prange
 import pandas as pd
 import json
@@ -42,15 +37,85 @@ import numpy as np
 import h2o
 import re
 from sklearn.preprocessing import QuantileTransformer
-from google.cloud import bigquery
+try:
+    from google.cloud import bigquery
+except Exception:
+    bigquery = None
 np.random.seed(54321)
 
-import snowflake.connector as snow_con
+try:
+    import snowflake.connector as snow_con
+except Exception:
+    snow_con = None
 import getpass as gp
 
 # import feather
-from IPython.core.display import display, HTML
-display(HTML("<style>.container { width:95% !important; }</style>"))
+try:
+    from IPython.core.display import display, HTML
+except Exception:
+    display = None
+    HTML = None
+
+
+def _run_ipython_magic(name, value):
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+        if ip is not None:
+            ip.run_line_magic(name, value)
+    except Exception:
+        pass
+
+
+def _normalize_local_path(path_value):
+    if path_value.startswith("dbfs:/"):
+        return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
+    return path_value
+
+
+def _get_spark_session():
+    try:
+        return spark  # type: ignore[name-defined]
+    except Exception:
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession.getActiveSession()
+        except Exception:
+            return None
+
+
+def _get_secret(scope, key):
+    if not scope or not key:
+        return None
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+    except Exception:
+        return None
+
+
+def _get_credential(env_name, prompt_label):
+    value = os.getenv(env_name)
+    if value:
+        return value
+
+    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
+    secret_key = os.getenv(f"{env_name}_KEY")
+    secret_value = _get_secret(secret_scope, secret_key)
+    if secret_value:
+        return secret_value
+
+    if sys.stdin and sys.stdin.isatty():
+        return gp.getpass(prompt_label)
+
+    raise RuntimeError(
+        f"No se encontro {env_name}. Configura variable de entorno o secreto en Databricks."
+    )
+
+
+_run_ipython_magic('load_ext', 'autoreload')
+_run_ipython_magic('autoreload', '2')
+
+if display is not None and HTML is not None:
+    display(HTML("<style>.container { width:95% !important; }</style>"))
 pd.set_option('display.max_columns',2000)
 
 
@@ -60,9 +125,18 @@ pd.set_option('display.max_columns',2000)
 #1. Ubicación de datos y nombre de proyecto (Varía entre Colmena y Spike)
 ###########################################################
 pid = "estudios-242917"
-datos_ltv_folder = "/estudio/data/ltv/Input/"
+spark_session = _get_spark_session()
+default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
+carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
+carpeta_ltv = f"{carpeta_ltv_path.as_posix()}/"
+datos_ltv_folder = f"{(carpeta_ltv_path / 'Input').as_posix()}/"
 #asume que existen las carpetas "Greats_expectations_LTV", "models", "Output"
-carpeta_ltv = "/estudio/data/ltv/" 
+for required_dir in [
+    Path(datos_ltv_folder),
+    carpeta_ltv_path / "Greats_expectations_LTV",
+    carpeta_ltv_path / "Output",
+]:
+    required_dir.mkdir(parents=True, exist_ok=True)
 
 #2. Cambiar: Qué periodo se va a predecir?
 ###########################################################
@@ -126,16 +200,10 @@ print(nombre_tabla, nombre_base_consolidada, nombre_ltv_new_mes_anterior, nombre
 # In[ ]:
 
 
-snow_user = gp.getpass("snow_user")
-snow_pass = gp.getpass("snow_pass")
-snow_account = "isapre_colmena.us-east-1"
+snow_user = os.getenv("SNOWFLAKE_USER")
+snow_pass = os.getenv("SNOWFLAKE_PASSWORD")
+snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 snow_warehouse = "P_OPX"
-
-snow = snow_con.connect(user=snow_user,
-                        password=snow_pass,
-                        account=snow_account,
-                        warehouse=snow_warehouse
-                        )
 
 
 # In[ ]:
@@ -143,12 +211,31 @@ snow = snow_con.connect(user=snow_user,
 
 
 
-with snow.cursor() as cur:
-    print(f"{periodo_prediccion}")
-    cur.execute(f"SET (per_desde, per_hasta) = ({periodo_prediccion}, {periodo_prediccion}); ")
-    cur.execute('SELECT * FROM EST.P_DDV_EST.JC_PRED_LTV_INPUT;')
-    data_ltv_snow = cur.fetch_pandas_all()
-    data_ltv_snow.to_csv(datos_ltv_folder+nombre_base, index=False, compression='gzip')
+if spark_session is not None:
+    print("Leyendo EST.P_DDV_EST.JC_PRED_LTV_INPUT desde Spark/Databricks...")
+    data_ltv_snow = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT").toPandas()
+else:
+    if snow_con is None:
+        raise ImportError(
+            "snowflake-connector-python no esta disponible. Ejecuta en Databricks con Spark o instala la libreria."
+        )
+    if not snow_user:
+        snow_user = _get_credential("SNOWFLAKE_USER", "snow_user")
+    if not snow_pass:
+        snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "snow_pass")
+
+    snow = snow_con.connect(user=snow_user,
+                            password=snow_pass,
+                            account=snow_account,
+                            warehouse=snow_warehouse
+                            )
+    with snow.cursor() as cur:
+        print(f"{periodo_prediccion}")
+        cur.execute(f"SET (per_desde, per_hasta) = ({periodo_prediccion}, {periodo_prediccion}); ")
+        cur.execute('SELECT * FROM EST.P_DDV_EST.JC_PRED_LTV_INPUT;')
+        data_ltv_snow = cur.fetch_pandas_all()
+
+data_ltv_snow.to_csv(datos_ltv_folder + nombre_base, index=False, compression='gzip')
 
 
 # In[ ]:
