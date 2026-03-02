@@ -7,13 +7,6 @@
 
 
 # usar kernel spikelabs_env_3
-get_ipython().run_line_magic('load_ext', 'autoreload')
-get_ipython().run_line_magic('autoreload', '2')
-
-#Cambie la ruta al PD; versión anterior:  estudio/data/
-
-disco = '/mnt/disks/modelos/' #al bucket (original): /estudio/data/
-
 import pandas as pd
 #import feather
 from itertools import product
@@ -21,6 +14,7 @@ import numpy as np
 import h2o
 import seaborn as sns
 import os
+from pathlib import Path
 from scipy.stats import wasserstein_distance as w_dist
 import warnings
 warnings.filterwarnings('ignore')
@@ -30,17 +24,106 @@ import tqdm
 import getpass as gp
 
 import sys
-sys.path.append(disco +'Proyecto_GES/script_graficos/')
-from plot_helpers import compare_cont_dists
-from plot_helpers import compare_categorical_dists
+try:
+    from snowflake.connector.pandas_tools import pd_writer
+except Exception:
+    pd_writer = None
 
-from snowflake import connector
-from snowflake.connector.pandas_tools import pd_writer, write_pandas
-from sqlalchemy import create_engine
+try:
+    from sqlalchemy import create_engine
+except Exception:
+    create_engine = None
+
+try:
+    from IPython.core.display import display, HTML
+except Exception:
+    display = None
+    HTML = None
 
 
-from IPython.core.display import display, HTML
-display(HTML("<style>.container { width:95% !important; }</style>"))
+def _run_ipython_magic(name, value):
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+        if ip is not None:
+            ip.run_line_magic(name, value)
+    except Exception:
+        pass
+
+
+def _normalize_local_path(path_value):
+    if path_value.startswith("dbfs:/"):
+        return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
+    return path_value
+
+
+def _get_spark_session():
+    try:
+        return spark  # type: ignore[name-defined]
+    except Exception:
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession.getActiveSession()
+        except Exception:
+            return None
+
+
+def _get_secret(scope, key):
+    if not scope or not key:
+        return None
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+    except Exception:
+        return None
+
+
+def _get_credential(env_name, prompt_label):
+    value = os.getenv(env_name)
+    if value:
+        return value
+
+    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
+    secret_key = os.getenv(f"{env_name}_KEY")
+    secret_value = _get_secret(secret_scope, secret_key)
+    if secret_value:
+        return secret_value
+
+    if sys.stdin and sys.stdin.isatty():
+        return gp.getpass(prompt=prompt_label)
+
+    raise RuntimeError(
+        f"No se encontro {env_name}. Configura variable de entorno o secreto en Databricks."
+    )
+
+
+def _resolve_period_file(base_dir, period_tag, contains_token):
+    for _, _, files in os.walk(str(base_dir)):
+        for file_name in files:
+            if period_tag in file_name and contains_token in file_name.lower():
+                return file_name
+    return None
+
+
+_run_ipython_magic('load_ext', 'autoreload')
+_run_ipython_magic('autoreload', '2')
+
+#Cambie la ruta al PD; versión anterior:  estudio/data/
+spark_session = _get_spark_session()
+default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
+disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
+
+script_graficos = Path(disco) / "Proyecto_GES" / "script_graficos"
+if script_graficos.exists():
+    sys.path.append(str(script_graficos))
+try:
+    from plot_helpers import compare_cont_dists
+    from plot_helpers import compare_categorical_dists
+except Exception:
+    compare_cont_dists = None
+    compare_categorical_dists = None
+
+
+if display is not None and HTML is not None:
+    display(HTML("<style>.container { width:95% !important; }</style>"))
 # para poder ver todas las columnas
 pd.set_option('display.max_columns',2000)
 
@@ -48,8 +131,7 @@ pd.set_option('display.max_columns',2000)
 # In[2]:
 
 
-snow_user = gp.getpass(prompt='Usuario SnowFlake')
-snow_pass = gp.getpass(prompt = 'Password SnowFlake')
+snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 
 
 # In[3]:
@@ -65,41 +147,54 @@ renta_tope = 84.3                                               #modifcar al top
 #datos del training
 train_file = 'retrain.csv'
 #carpeta de inputs
-inputs = 'input/prediccion/'
+repo_dir = Path(__file__).resolve().parent
+inputs = Path(_normalize_local_path(
+    os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
+))
 
 #especial para el archivo original sin pre-proceso
 #aca va ltv del periodo (la tabla no predicciones) y base ges
-input2 = disco+'Proyecto_GES/Prediccion/input/preproceso/'
+input2 = Path(_normalize_local_path(
+    os.getenv("GES_PREPROCESO_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/preproceso")
+))
 
 #carpeta de output
-outputs = 'output/'
+outputs = Path(_normalize_local_path(
+    os.getenv("GES_OUTPUT_DIR", str(repo_dir / "output"))
+))
 
-#path total desde root, para el h2o laod
+#path total desde root, para el h2o load
 #aca va ltv predicciones del periodo y el archivo que se genera en el notebook de preproceso
-input_total = disco+'Proyecto_GES/Prediccion/input/prediccion/'
+input_total = Path(_normalize_local_path(
+    os.getenv("GES_PREDICCION_SCAN_DIR", str(inputs))
+))
+
+inputs.mkdir(parents=True, exist_ok=True)
+outputs.mkdir(parents=True, exist_ok=True)
 
 #datos del periodo a predecir
 #ges_file = f'ready_to_pred_{periodo}.csv'
 #datos del ltv
 #Automatizar la selección de este archivo.
 #ltv_file = f'02. prediccion_ltv_con_categoria_{periodo}.csv'
-for folder,_, files in os.walk(input_total):
-    for file in files:
-        if periodo in file:
-            if 'ready' in file.lower():
-                ges_file = file
-            elif 'prediccion_ltv' in file.lower():
-                ltv_file = file
+ges_file = _resolve_period_file(input_total, periodo, "ready")
+ltv_file = _resolve_period_file(input_total, periodo, "prediccion_ltv")
 
 
 
 #ges sin prep  20.04.17_GES_mar20
 #ges_r_file = f'2021.03.19_GES_{periodo}.csv.zip'
 
-for folder,_, files in os.walk(input2):
-    for file in files:
-        if periodo in file and 'ges' in file.lower():
-            ges_r_file = file
+ges_r_file = _resolve_period_file(input2, periodo, "ges")
+
+if ges_file is None:
+    raise FileNotFoundError(
+        f"No se encontro archivo ready_to_pred para periodo {periodo} en {input_total}"
+    )
+if ltv_file is None:
+    raise FileNotFoundError(
+        f"No se encontro archivo prediccion_ltv para periodo {periodo} en {input_total}"
+    )
             
 print(f'archivo ges: {ges_file}')
 print(f'archivo ltv: {ltv_file}')
@@ -114,7 +209,7 @@ print(f'archivo ges preproceso: {ges_r_file}')
 
 
 #cargamos datos ges
-df_ges = pd.read_csv(inputs+ges_file,index_col=0)
+df_ges = pd.read_csv(inputs / ges_file, index_col=0)
 
 
 # In[5]:
@@ -179,7 +274,7 @@ df_ges['periodo'] = pd.to_datetime(df_ges['periodo'])
 
 
 #cargamos datos de entrenamiento
-df_train = pd.read_csv(inputs+train_file,index_col=0)
+df_train = pd.read_csv(inputs / train_file, index_col=0)
 target = 'fuga_5m'
 
 
@@ -187,7 +282,7 @@ target = 'fuga_5m'
 
 
 #cargamos datos ltv que se usaran posteriormente
-df_ltv = pd.read_csv(inputs+ltv_file) #.drop(columns = ['Unnamed: 0', 'index'])
+df_ltv = pd.read_csv(inputs / ltv_file) #.drop(columns = ['Unnamed: 0', 'index'])
 
 
 # In[11]:
@@ -210,7 +305,7 @@ h2o.remove_all()
 
 
 #cargamos el modelo
-modelo_fuga = h2o.load_model(path=inputs+'modelos/may20_modelo_proyecto_ges')
+modelo_fuga = h2o.load_model(path=str(inputs / "modelos" / "may20_modelo_proyecto_ges"))
 
 
 # In[14]:
@@ -294,7 +389,7 @@ assert len(df_gl) == n_unique
 # In[22]:
 
 
-df_gl[guardar_cols].to_csv(outputs+f'base_entregable_{periodo}_Prob_Fuga.csv')
+df_gl[guardar_cols].to_csv(outputs / f'base_entregable_{periodo}_Prob_Fuga.csv')
 
 
 # In[23]:
@@ -331,7 +426,7 @@ df_gl[guardar_cols].to_csv(outputs+f'base_entregable_{periodo}_Prob_Fuga.csv')
 
 
 #script para crear los moving averages
- def create_mov_avgs(datos, shift_m, cols, window=6, min_periods=3):
+def create_mov_avgs(datos, shift_m, cols, window=6, min_periods=3):
     """
     Crea medias móviles para variables `cols`.
     shift_m: el número de meses para ir hacia atrás
@@ -473,7 +568,7 @@ def entregar(df,columns,name):
     df_entregable = df_entregable.rename(columns={'predicted_Margen_t+1': 'ltv_predicted_1y', 'prediccion_probabilidad_fuga_1y': 'prob_fuga_1y'})
     df_entregable['ltv_predicted_1y'] = .9 * df_entregable['ltv_predicted_1y']
     df_entregable.drop_duplicates(subset=['id_titular'],inplace=True)
-    df_entregable.to_csv(outputs+name)
+    df_entregable.to_csv(outputs / name)
     
     return df_entregable
 
@@ -551,40 +646,62 @@ except:
 # In[46]:
 
 
-engine = create_engine(
-    'snowflake://{user}:{password}@{account}/EST/P_DDV_EST'.format(
-        user=snow_user,
-        password=snow_pass,
-        account='isapre_colmena.us-east-1'
-    )
-)
-try:
-    conn = engine.connect()
-#     results = conn.execute('select CURRENT_DATABASE(), CURRENT_SCHEMA()').fetchall()
-    
-    #Truncamos
-    conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_LTV_PRED')
-    conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED')
-    conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_PRED')
-    
-    print('Tablas truncadas')
-        
-    #Cargamos
-    print('Comienzo carga')
-    print('JC_ML_GES_PRED ', end ='')
-    df_sfil_ent.rename(columns = lambda x: x.upper()).to_sql('JC_ML_GES_PRED', conn, index = False, if_exists='append', method = pd_writer) # , chunksize=12000, 
-    print('Ok')
-    print('JC_ML_GES_CLUSTER_PRED ', end = '')
-    df_fil_clus.drop(columns=['index']).rename(columns = lambda x: x.upper()).to_sql('JC_ML_GES_CLUSTER_PRED', conn, index = False, if_exists='append', method = pd_writer)
-    print('OK')
-    print('JC_ML_LTV_PRED')
-    df_ltv.drop(columns=['index']).rename(columns = lambda x: x.upper()).to_sql('JC_ML_LTV_PRED', conn, index = False, if_exists='append', method = pd_writer)
-    print('OK')
-    print('Carga completa')
+df_sfil_ent_to_write = df_sfil_ent.rename(columns=lambda x: x.upper())
+df_fil_clus_to_write = df_fil_clus.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
+df_ltv_to_write = df_ltv.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
 
-finally:
-    conn.close()
-    engine.dispose()
+if spark_session is not None:
+    print('Comienzo carga en tablas Databricks')
+    spark_session.createDataFrame(df_sfil_ent_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_PRED")
+    print('JC_ML_GES_PRED OK')
+    spark_session.createDataFrame(df_fil_clus_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED")
+    print('JC_ML_GES_CLUSTER_PRED OK')
+    spark_session.createDataFrame(df_ltv_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_LTV_PRED")
+    print('JC_ML_LTV_PRED OK')
+    print('Carga completa')
+else:
+    if create_engine is None or pd_writer is None:
+        raise ImportError(
+            "Dependencias de Snowflake no disponibles. Ejecuta en Databricks con Spark o instala snowflake/sqlalchemy."
+        )
+
+    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario SnowFlake")
+    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password SnowFlake")
+    engine = create_engine(
+        'snowflake://{user}:{password}@{account}/EST/P_DDV_EST'.format(
+            user=snow_user,
+            password=snow_pass,
+            account=snow_account
+        )
+    )
+    conn = None
+    try:
+        conn = engine.connect()
+    #     results = conn.execute('select CURRENT_DATABASE(), CURRENT_SCHEMA()').fetchall()
+        
+        #Truncamos
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_LTV_PRED')
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED')
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_PRED')
+        
+        print('Tablas truncadas')
+            
+        #Cargamos
+        print('Comienzo carga')
+        print('JC_ML_GES_PRED ', end ='')
+        df_sfil_ent_to_write.to_sql('JC_ML_GES_PRED', conn, index=False, if_exists='append', method=pd_writer) # , chunksize=12000,
+        print('Ok')
+        print('JC_ML_GES_CLUSTER_PRED ', end='')
+        df_fil_clus_to_write.to_sql('JC_ML_GES_CLUSTER_PRED', conn, index=False, if_exists='append', method=pd_writer)
+        print('OK')
+        print('JC_ML_LTV_PRED ', end='')
+        df_ltv_to_write.to_sql('JC_ML_LTV_PRED', conn, index=False, if_exists='append', method=pd_writer)
+        print('OK')
+        print('Carga completa')
+    finally:
+        if conn is not None:
+            conn.close()
+        engine.dispose()
 
 
 # In[47]:
