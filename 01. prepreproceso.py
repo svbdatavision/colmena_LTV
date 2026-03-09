@@ -95,6 +95,46 @@ def _require_columns(df, required_columns, table_name):
         )
 
 
+def _resolve_ltv_file(inputs_dir, periodo):
+    override = os.getenv("GES_LTV_INPUT_FILE", "").strip()
+    if override:
+        override_path = Path(_normalize_local_path(override))
+        if not override_path.is_absolute():
+            override_path = inputs_dir / override_path
+        if not override_path.exists():
+            raise RuntimeError(
+                f"GES_LTV_INPUT_FILE apunta a un archivo inexistente: {override_path}"
+            )
+        return override_path
+
+    search_dirs = [inputs_dir, inputs_dir.parent]
+    matched_period = []
+    matched_any = []
+
+    for base_dir in search_dirs:
+        if not base_dir.exists():
+            continue
+        for root, _, files in os.walk(str(base_dir)):
+            for filename in files:
+                low = filename.lower()
+                if "ltv" not in low:
+                    continue
+                path = Path(root) / filename
+                matched_any.append(path)
+                if periodo in filename:
+                    matched_period.append(path)
+
+    candidates = matched_period if matched_period else matched_any
+    if not candidates:
+        raise RuntimeError(
+            "No se encontro archivo LTV de entrada. "
+            "Copie un archivo con 'ltv' en el nombre en input/preproceso "
+            "o configure GES_LTV_INPUT_FILE con la ruta exacta."
+        )
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 _run_ipython_magic('matplotlib', 'inline')
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
@@ -279,35 +319,8 @@ ges = str(ges_file)
 
 
 print('Buscando los datos de ltv del periodo...')
-
-temp_ltv = []
-
-for root, subdirs, files in os.walk(str(inputs)):
-     for filename in files:
-            if 'ltv' in filename.lower():
-                if periodo in filename:
-                    temp_ltv.append(filename)
-try:
-    print('Los archivos encontrados son:...')
-
-    print(*temp_ltv,sep='\n')
-    
-    print(f'Se utilizara el archivo {temp_ltv[0]} para el preproceso')
-    
-    ltv = temp_ltv[0]
-    
-except IndexError:
-    print('No hay archivos en el periodo, buscando en todos los periodos...')
-
-    for root, subdirs, files in os.walk(str(inputs.parent)):
-         for filename in files:
-                if 'ges' in filename.lower():
-                        temp_ltv.append(filename)
-    print('Los archivos son:')
-    
-    print(*temp_ltv,sep='\n')
-    
-    print('Modifique más abajo el archivo que desea utilizar')
+ltv_path = _resolve_ltv_file(inputs, periodo)
+print(f'Se utilizara el archivo {ltv_path.name} para el preproceso')
 
 
 # In[9]:
@@ -320,7 +333,7 @@ except IndexError:
 
 
 #cargamos datos ltv
-df_ltv =  pd.read_csv(inputs / ltv, sep=",", compression='gzip').rename(columns = lambda x: x.lower())
+df_ltv = pd.read_csv(ltv_path, sep=",", compression='infer').rename(columns = lambda x: x.lower())
 df_ltv['periodo'] = pd.to_datetime(df_ltv['periodo'], format='%Y%m')
 # df_ltv.head()
 
