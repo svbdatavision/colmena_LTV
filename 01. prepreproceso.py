@@ -81,6 +81,20 @@ def _get_periodo_prediccion_param():
     return int(raw_value)
 
 
+def _read_sql_table_as_pandas(spark_session, table_name):
+    print(f"Leyendo {table_name} desde Spark/Databricks...")
+    # Si el volumen crece, considerar filtrar por periodo antes de pasar a pandas.
+    return spark_session.table(table_name).toPandas()
+
+
+def _require_columns(df, required_columns, table_name):
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise RuntimeError(
+            f"La tabla {table_name} no contiene columnas requeridas: {missing}"
+        )
+
+
 _run_ipython_magic('matplotlib', 'inline')
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
@@ -178,6 +192,20 @@ in_pred = Path(_normalize_local_path(
 inputs.mkdir(parents=True, exist_ok=True)
 outputs.mkdir(parents=True, exist_ok=True)
 in_pred.mkdir(parents=True, exist_ok=True)
+
+aux_schema = os.getenv("GES_AUX_SQL_SCHEMA", "EST.P_DDV_EST").strip() or "EST.P_DDV_EST"
+table_prm_categoria = os.getenv(
+    "GES_SQL_TABLE_PRM_CATEGORIA", f"{aux_schema}.PRM_CATEGORIA"
+)
+table_division_regiones = os.getenv(
+    "GES_SQL_TABLE_DIVISION_REGIONES", f"{aux_schema}.DIVISION_REGIONES"
+)
+table_cod_comuna = os.getenv(
+    "GES_SQL_TABLE_COD_COMUNA", f"{aux_schema}.COD_COMUNA"
+)
+table_nse_y_pobreza = os.getenv(
+    "GES_SQL_TABLE_NSE_Y_POBREZA", f"{aux_schema}.NSE_Y_POBREZA"
+)
 
 nombre_archivo = f'{hoy:%y.%m.%d}_GES_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}.gz'
 ges_file = inputs / nombre_archivo
@@ -284,10 +312,7 @@ except IndexError:
 # In[9]:
 
 
-#datos auxiliares
-div_reg = 'xlsx/Division Regiones.xlsx'
-comunas = 'xlsx/cod comuna.xlsx'
-pobreza = 'xlsx/nse_y_pobreza.xlsx'
+#datos auxiliares (migrados desde Excel a tablas SQL)
 
 
 # In[10]:
@@ -381,8 +406,9 @@ categorias = {'alto': alto, 'medio': medio, 'bajo': bajo, 'le': le}
 
 
 #demora 1 min
-cat = 'xlsx/PRM_Categoria.xlsx'
-categoria = pd.read_excel(inputs / cat)
+categoria = _read_sql_table_as_pandas(spark_session, table_prm_categoria)
+categoria = categoria.rename(columns=lambda x: str(x).strip().lower())
+_require_columns(categoria, ['cod_categoria', 'preferente'], table_prm_categoria)
 df = pd.merge(df, categoria[['cod_categoria', 'preferente']], how='left', 
                  left_on='categoria_cod', right_on='cod_categoria')
 df['cat_linea_plan'] = df.preferente.apply(cat_linea_plan)
@@ -425,13 +451,34 @@ df.preferente = df.preferente.apply(limpiar_preferente)
 
 
 # demora 
-division_reg = (pd.read_excel(inputs / div_reg, skiprows=1)
-                [19::].rename(columns={'Unnamed: 3': 'norte_centro_sur'})
-               [['COD_REGION', 'GLS_WEB_REGION', 'norte_centro_sur']])
+division_reg = _read_sql_table_as_pandas(spark_session, table_division_regiones)
+division_reg = division_reg.rename(columns=lambda x: str(x).strip())
+if 'Unnamed: 3' in division_reg.columns and 'norte_centro_sur' not in division_reg.columns:
+    division_reg = division_reg[19:].rename(columns={'Unnamed: 3': 'norte_centro_sur'})
+division_reg = division_reg.rename(
+    columns={
+        'cod_region': 'COD_REGION',
+        'gls_web_region': 'GLS_WEB_REGION',
+        'NORTE_CENTRO_SUR': 'norte_centro_sur',
+    }
+)
+_require_columns(
+    division_reg,
+    ['COD_REGION', 'GLS_WEB_REGION', 'norte_centro_sur'],
+    table_division_regiones,
+)
+division_reg = division_reg[['COD_REGION', 'GLS_WEB_REGION', 'norte_centro_sur']]
 division_reg['COD_REGION'] = division_reg.COD_REGION.astype('int')
 
-cod_comuna = pd.read_excel(inputs / comunas)
-nse_y_pobreza = pd.read_excel(inputs / pobreza)
+cod_comuna = _read_sql_table_as_pandas(spark_session, table_cod_comuna)
+cod_comuna = cod_comuna.rename(columns=lambda x: str(x).strip().lower())
+_require_columns(cod_comuna, ['con_comuna_gls', 'cod_comuna'], table_cod_comuna)
+
+nse_y_pobreza = _read_sql_table_as_pandas(spark_session, table_nse_y_pobreza)
+nse_y_pobreza = nse_y_pobreza.rename(columns=lambda x: str(x).strip())
+if 'comuna' in nse_y_pobreza.columns and 'COMUNA' not in nse_y_pobreza.columns:
+    nse_y_pobreza = nse_y_pobreza.rename(columns={'comuna': 'COMUNA'})
+_require_columns(nse_y_pobreza, ['COMUNA'], table_nse_y_pobreza)
 
 nse_y_pobreza = pd.merge(nse_y_pobreza, cod_comuna, how='inner',
                         left_on='COMUNA', right_on='con_comuna_gls')
