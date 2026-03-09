@@ -1,0 +1,44 @@
+# =============================
+# Databricks cluster dependencies
+# =============================
+
+# Core data & ML
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+optuna==3.5.0
+h2o
+numba
+scipy>=1.11.0
+joblib>=1.3.0
+
+# Data access / file formats
+pyarrow>=14.0.0
+openpyxl>=3.0.0
+snowflake-connector-python[pandas]>=3.0.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+requests>=2.32.3
+
+# Notebook / validation tooling used in scripts
+great-expectations
+tqdm>=4.65.0
+
+# Visualization & interpretation
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+shap>=0.42.0
+
+# Web / document utilities used by other models
+pdfminer.six>=20231228
+pypasser>=0.0.5
+selenium>=4.28.1
+
+# Testing & quality (optional on production clusters)
+pytest>=7.3.0
+pytest-cov>=4.1.0
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.3.0
