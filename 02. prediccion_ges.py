@@ -21,18 +21,7 @@ warnings.filterwarnings('ignore')
 import json
 import tqdm
 
-import getpass as gp
-
 import sys
-try:
-    from snowflake.connector.pandas_tools import pd_writer
-except Exception:
-    pd_writer = None
-
-try:
-    from sqlalchemy import create_engine
-except Exception:
-    create_engine = None
 
 try:
     from IPython.core.display import display, HTML
@@ -67,34 +56,6 @@ def _get_spark_session():
             return None
 
 
-def _get_secret(scope, key):
-    if not scope or not key:
-        return None
-    try:
-        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
-    except Exception:
-        return None
-
-
-def _get_credential(env_name, prompt_label):
-    value = os.getenv(env_name)
-    if value:
-        return value
-
-    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
-    secret_key = os.getenv(f"{env_name}_KEY")
-    secret_value = _get_secret(secret_scope, secret_key)
-    if secret_value:
-        return secret_value
-
-    if sys.stdin and sys.stdin.isatty():
-        return gp.getpass(prompt=prompt_label)
-
-    raise RuntimeError(
-        f"No se encontro {env_name}. Configura variable de entorno o secreto en Databricks."
-    )
-
-
 def _get_periodo_prediccion_param():
     raw_value = ""
     try:
@@ -124,8 +85,9 @@ _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
 #Cambie la ruta al PD; versión anterior:  estudio/data/
+repo_dir = Path(__file__).resolve().parent
 spark_session = _get_spark_session()
-default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
+default_storage_root = str(repo_dir)
 disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
 
 script_graficos = Path(disco) / "Proyecto_GES" / "script_graficos"
@@ -146,12 +108,6 @@ pd.set_option('display.max_columns',2000)
 
 
 # In[2]:
-
-
-snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
-
-
-# In[3]:
 
 
 # las demas rutas dependen de esto, por lo que es necesario verificar
@@ -177,7 +133,6 @@ renta_tope = 84.3                                               #modifcar al top
 #datos del training
 train_file = 'retrain.csv'
 #carpeta de inputs
-repo_dir = Path(__file__).resolve().parent
 inputs = Path(_normalize_local_path(
     os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
 ))
@@ -185,7 +140,7 @@ inputs = Path(_normalize_local_path(
 #especial para el archivo original sin pre-proceso
 #aca va ltv del periodo (la tabla no predicciones) y base ges
 input2 = Path(_normalize_local_path(
-    os.getenv("GES_PREPROCESO_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/preproceso")
+    os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))
 ))
 
 #carpeta de output
@@ -680,58 +635,18 @@ df_sfil_ent_to_write = df_sfil_ent.rename(columns=lambda x: x.upper())
 df_fil_clus_to_write = df_fil_clus.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
 df_ltv_to_write = df_ltv.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
 
-if spark_session is not None:
-    print('Comienzo carga en tablas Databricks')
-    spark_session.createDataFrame(df_sfil_ent_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_PRED")
-    print('JC_ML_GES_PRED OK')
-    spark_session.createDataFrame(df_fil_clus_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED")
-    print('JC_ML_GES_CLUSTER_PRED OK')
-    spark_session.createDataFrame(df_ltv_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_LTV_PRED")
-    print('JC_ML_LTV_PRED OK')
-    print('Carga completa')
-else:
-    if create_engine is None or pd_writer is None:
-        raise ImportError(
-            "Dependencias de Snowflake no disponibles. Ejecuta en Databricks con Spark o instala snowflake/sqlalchemy."
-        )
-
-    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario SnowFlake")
-    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password SnowFlake")
-    engine = create_engine(
-        'snowflake://{user}:{password}@{account}/EST/P_DDV_EST'.format(
-            user=snow_user,
-            password=snow_pass,
-            account=snow_account
-        )
+if spark_session is None:
+    raise RuntimeError(
+        "Este script requiere una sesion Spark activa de Databricks."
     )
-    conn = None
-    try:
-        conn = engine.connect()
-    #     results = conn.execute('select CURRENT_DATABASE(), CURRENT_SCHEMA()').fetchall()
-        
-        #Truncamos
-        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_LTV_PRED')
-        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED')
-        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_PRED')
-        
-        print('Tablas truncadas')
-            
-        #Cargamos
-        print('Comienzo carga')
-        print('JC_ML_GES_PRED ', end ='')
-        df_sfil_ent_to_write.to_sql('JC_ML_GES_PRED', conn, index=False, if_exists='append', method=pd_writer) # , chunksize=12000,
-        print('Ok')
-        print('JC_ML_GES_CLUSTER_PRED ', end='')
-        df_fil_clus_to_write.to_sql('JC_ML_GES_CLUSTER_PRED', conn, index=False, if_exists='append', method=pd_writer)
-        print('OK')
-        print('JC_ML_LTV_PRED ', end='')
-        df_ltv_to_write.to_sql('JC_ML_LTV_PRED', conn, index=False, if_exists='append', method=pd_writer)
-        print('OK')
-        print('Carga completa')
-    finally:
-        if conn is not None:
-            conn.close()
-        engine.dispose()
+print('Comienzo carga en tablas Databricks')
+spark_session.createDataFrame(df_sfil_ent_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_PRED")
+print('JC_ML_GES_PRED OK')
+spark_session.createDataFrame(df_fil_clus_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED")
+print('JC_ML_GES_CLUSTER_PRED OK')
+spark_session.createDataFrame(df_ltv_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_LTV_PRED")
+print('JC_ML_LTV_PRED OK')
+print('Carga completa')
 
 
 # In[47]:

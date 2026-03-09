@@ -27,19 +27,6 @@ from pathlib import Path
 # sys.path.append("../../../spike")
 # import SpikePy as sp
 
-import getpass as gp
-
-try:
-    import snowflake.connector as snow
-except Exception:
-    snow = None
-
-try:
-    from sqlalchemy import create_engine
-except Exception:
-    create_engine = None
-
-
 def _run_ipython_magic(name, value):
     try:
         ip = get_ipython()  # type: ignore[name-defined]
@@ -64,34 +51,6 @@ def _normalize_local_path(path_value):
     if path_value.startswith("dbfs:/"):
         return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
     return path_value
-
-
-def _get_secret(scope, key):
-    if not scope or not key:
-        return None
-    try:
-        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
-    except Exception:
-        return None
-
-
-def _get_credential(env_name, prompt_label):
-    value = os.getenv(env_name)
-    if value:
-        return value
-
-    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
-    secret_key = os.getenv(f"{env_name}_KEY")
-    secret_value = _get_secret(secret_scope, secret_key)
-    if secret_value:
-        return secret_value
-
-    if sys.stdin and sys.stdin.isatty():
-        return gp.getpass(prompt=prompt_label)
-
-    raise RuntimeError(
-        f"No se encontro {env_name}. Configura variable de entorno o secreto de Databricks."
-    )
 
 
 def _get_periodo_prediccion_param():
@@ -150,47 +109,24 @@ periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
 
 
 spark_session = _get_spark_session()
-snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 
 
 # In[4]:
 
 
-if spark_session is not None:
-    print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
-    df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
-else:
-    if create_engine is None:
-        raise ImportError(
-            "sqlalchemy no esta disponible. Instalar dependencia o ejecutar en Databricks con Spark."
-        )
-    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario")
-    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password")
-    engine = create_engine(
-        'snowflake://{user}:{password}@{account}/'.format(
-            user=snow_user,
-            password=snow_pass,
-            account=snow_account,
-        )
+if spark_session is None:
+    raise RuntimeError(
+        "Este script requiere una sesion Spark activa de Databricks."
     )
-    connection = None
-    try:
-        connection = engine.connect()
-        results = connection.execute('select current_version()').fetchone()
-        print(results[0])
-        df_ges = pd.read_sql('SELECT * FROM EST.P_DDV_EST.JC_GES_PRED;', con=engine)
-    finally:
-        if connection is not None:
-            connection.close()
-        engine.dispose()
+print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
+df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
 
 
 # In[5]:
 
 
 repo_dir = Path(__file__).resolve().parent
-default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
-disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
+default_storage_root = str(repo_dir)
 inputs = Path(_normalize_local_path(
     os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))
 ))
@@ -198,7 +134,7 @@ outputs = Path(_normalize_local_path(
     os.getenv("GES_OUTPUT_DIR", str(repo_dir / "output"))
 ))
 in_pred = Path(_normalize_local_path(
-    os.getenv("GES_PREDICCION_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/prediccion")
+    os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
 ))
 
 inputs.mkdir(parents=True, exist_ok=True)
