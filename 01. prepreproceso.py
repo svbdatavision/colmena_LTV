@@ -94,6 +94,23 @@ def _get_credential(env_name, prompt_label):
     )
 
 
+def _get_periodo_prediccion_param():
+    raw_value = ""
+    try:
+        dbutils.widgets.text("periodo_prediccion", "")  # type: ignore[name-defined]
+        raw_value = dbutils.widgets.get("periodo_prediccion").strip()  # type: ignore[name-defined]
+    except Exception:
+        raw_value = os.getenv("PERIODO_PREDICCION", "").strip()
+
+    if not raw_value:
+        return None
+    if not (raw_value.isdigit() and len(raw_value) == 6):
+        raise ValueError(
+            "periodo_prediccion debe tener formato YYYYMM (ejemplo: 202501)."
+        )
+    return int(raw_value)
+
+
 _run_ipython_magic('matplotlib', 'inline')
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
@@ -110,8 +127,13 @@ plt.style.use('fivethirtyeight')
 
 #periodo a predecir 'mes(3letras)año'
 hoy =  pd.to_datetime("today")
-fecha_prediccion =  hoy - pd.DateOffset(months=1, day=1)
-periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+periodo_prediccion_param = _get_periodo_prediccion_param()
+if periodo_prediccion_param is None:
+    fecha_prediccion =  hoy - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+else:
+    periodo_prediccion = periodo_prediccion_param
+    fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
 
 pre_ges = 0  # hubo cambio ges 5 meses antes del periodo de cierre 0 -> si no hubo cambio | 1 -> hubo cambio
 hay_ges = 0  # hay /habrá cambio ges en los 5 meses siguientes 0 -> si no habrá camnbio | 1 -> habrá cambio
