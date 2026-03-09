@@ -196,6 +196,7 @@ if spark_session is None:
         "Este script requiere una sesion Spark activa de Databricks."
     )
 print("Leyendo EST.P_DDV_EST.JC_PRED_LTV_INPUT desde Spark/Databricks...")
+# Si el volumen crece, considerar filtrar por periodo antes de pasar a pandas.
 data_ltv_snow = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT").toPandas()
 
 data_ltv_snow.to_csv(datos_ltv_folder + nombre_base, index=False, compression='gzip')
@@ -256,7 +257,11 @@ print("Ok")
 # In[ ]:
 
 
-h2o.init(port=54321, min_mem_size = 15, max_mem_size = 25)
+h2o.init(
+    port=54321,
+    min_mem_size="2g",
+    max_mem_size="4g"
+)
 h2o.remove_all()
 
 
@@ -867,8 +872,6 @@ ltv_table_name = f"LTV.PREDICCION_MODULOS_LTV_{nombre_fancy}"
 
 #Liberamos memoria de los procesos de h2o
 h2o.remove_all()
-h2o.shutdown()
-h2o.init(port=54321, min_mem_size='20g')
 
 
 # In[ ]:
@@ -1060,7 +1063,7 @@ df_p.to_csv("../../df_p.csv")
 
 
 import gc
-h2o.cluster().shutdown()
+h2o.remove_all()
 del df_p
 time.sleep(15)
 gc.collect()
@@ -1071,7 +1074,6 @@ time.sleep(25)
 
 
 # De nuevo para asegurarse de que la memoria esté disponible
-h2o.init(port=54321, min_mem_size='20g')
 h2o.remove_all()
 
 model = h2o.load_model(path=f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5')
