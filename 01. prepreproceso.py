@@ -119,14 +119,20 @@ if spark_session is None:
         "Este script requiere una sesion Spark activa de Databricks."
     )
 print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
-ansi_original = spark_session.conf.get("spark.sql.ansi.enabled")
-# El view de origen contiene CASTs con datos malformados (ej. '2/18');
-# en DBR con ANSI habilitado esto levanta error en vez de devolver NULL.
-spark_session.conf.set("spark.sql.ansi.enabled", "false")
-try:
-    df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
-finally:
-    spark_session.conf.set("spark.sql.ansi.enabled", ansi_original)
+# Evita evaluar el CAST invalido del view sobre fld_pertermino y lo reconstruye de forma segura.
+from pyspark.sql import functions as F
+df_ges_spark = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").drop("fld_pertermino")
+if "fld_termino" not in df_ges_spark.columns:
+    raise RuntimeError("No se encontro columna fld_termino para reconstruir fld_pertermino.")
+
+df_ges_spark = df_ges_spark.withColumn(
+    "fld_pertermino",
+    F.coalesce(
+        F.date_format(F.to_date(F.col("fld_termino"), "dd/MM/yyyy"), "yyyyMM").cast("int"),
+        F.date_format(F.to_date(F.col("fld_termino"), "yyyy/MM/dd"), "yyyyMM").cast("int"),
+    ),
+)
+df_ges = df_ges_spark.toPandas()
 
 
 # In[5]:
