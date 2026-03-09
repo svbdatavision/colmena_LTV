@@ -119,7 +119,14 @@ if spark_session is None:
         "Este script requiere una sesion Spark activa de Databricks."
     )
 print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
-df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
+ansi_original = spark_session.conf.get("spark.sql.ansi.enabled")
+# El view de origen contiene CASTs con datos malformados (ej. '2/18');
+# en DBR con ANSI habilitado esto levanta error en vez de devolver NULL.
+spark_session.conf.set("spark.sql.ansi.enabled", "false")
+try:
+    df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
+finally:
+    spark_session.conf.set("spark.sql.ansi.enabled", ansi_original)
 
 
 # In[5]:
