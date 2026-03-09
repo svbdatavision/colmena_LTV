@@ -166,8 +166,9 @@ for col_name, target_type in numeric_string_targets.items():
 df_ges_spark = df_ges_spark.withColumn(
     "fld_pertermino",
     F.coalesce(
-        F.date_format(F.to_date(F.col("fld_termino"), "dd/MM/yyyy"), "yyyyMM").cast("int"),
-        F.date_format(F.to_date(F.col("fld_termino"), "yyyy/MM/dd"), "yyyyMM").cast("int"),
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'MM/dd/yyyy'), 'yyyyMM') as int)"),
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'dd/MM/yyyy'), 'yyyyMM') as int)"),
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'yyyy/MM/dd'), 'yyyyMM') as int)"),
     ),
 )
 # Si el volumen crece, considerar filtrar por periodo antes de pasar a pandas.
