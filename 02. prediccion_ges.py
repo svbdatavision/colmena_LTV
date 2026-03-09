@@ -45,6 +45,17 @@ def _normalize_local_path(path_value):
     return path_value
 
 
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
 def _get_spark_session():
     try:
         return spark  # type: ignore[name-defined]
@@ -85,7 +96,7 @@ _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
 #Cambie la ruta al PD; versión anterior:  estudio/data/
-repo_dir = Path(__file__).resolve().parent
+repo_dir = _resolve_repo_dir()
 spark_session = _get_spark_session()
 if spark_session is None:
     raise RuntimeError(

@@ -53,6 +53,17 @@ def _normalize_local_path(path_value):
     return path_value
 
 
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
 def _get_periodo_prediccion_param():
     raw_value = ""
     try:
@@ -152,7 +163,7 @@ df_ges = df_ges_spark.toPandas()
 # In[5]:
 
 
-repo_dir = Path(__file__).resolve().parent
+repo_dir = _resolve_repo_dir()
 default_storage_root = str(repo_dir)
 inputs = Path(_normalize_local_path(
     os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))

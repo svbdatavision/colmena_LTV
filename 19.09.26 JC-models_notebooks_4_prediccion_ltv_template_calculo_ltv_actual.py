@@ -32,7 +32,10 @@ from pathlib import Path
 from numba import njit, prange
 import pandas as pd
 import json
-import great_expectations as ge
+try:
+    import great_expectations as ge
+except Exception:
+    ge = None
 import numpy as np
 import h2o
 import re
@@ -64,6 +67,17 @@ def _normalize_local_path(path_value):
     if path_value.startswith("dbfs:/"):
         return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
     return path_value
+
+
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
 
 
 def _get_spark_session():
@@ -108,7 +122,7 @@ pd.set_option('display.max_columns',2000)
 #1. Ubicación de datos y nombre de proyecto (Varía entre Colmena y Spike)
 ###########################################################
 pid = "estudios-242917"
-repo_dir = Path(__file__).resolve().parent
+repo_dir = _resolve_repo_dir()
 spark_session = _get_spark_session()
 default_ltv_base = str(repo_dir / "ltv")
 carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
@@ -537,26 +551,28 @@ df.drop(labels=['sexo'], axis=1, inplace=True)
 # Acá se hace check de Great Expectations intermedio
 df.to_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv')
 
-with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
-    my_expectations_config = json.load(f)
+if ge is not None:
+    with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
+        my_expectations_config = json.load(f)
 
-#El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script    
+    #El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script
+    my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
 
-my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
+    # Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
+    my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
+    my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
+    my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
+    my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
+    my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
 
-# Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
-my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
-my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
-my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
-my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
-my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
+    resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
 
-resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
-
-with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
-    json.dump(resultado, outfile)
-    
-print("Guardado!")
+    with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
+        json.dump(resultado, outfile)
+        
+    print("Guardado!")
+else:
+    print("great_expectations no disponible: se omite validacion intermedia.")
 
 #assert resultado['success']
 
@@ -1133,18 +1149,21 @@ tiempo_transcurrido = (end - start)/60
 
 ## Acá se hace check de Great Expectations final (output)
 
-with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
-    my_expectations_config = json.load(f)
+if ge is not None:
+    with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
+        my_expectations_config = json.load(f)
 
-my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
-                    
-resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
+    my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
+                        
+    resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
 
-with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
-          'w') as outfile:
-    json.dump(resultado_output, outfile)
+    with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
+              'w') as outfile:
+        json.dump(resultado_output, outfile)
 
-print("Guardado!")
+    print("Guardado!")
+else:
+    print("great_expectations no disponible: se omite validacion final.")
 
 #assert resultado_output['success']
 
