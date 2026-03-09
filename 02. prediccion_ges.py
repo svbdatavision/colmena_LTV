@@ -87,6 +87,10 @@ _run_ipython_magic('autoreload', '2')
 #Cambie la ruta al PD; versión anterior:  estudio/data/
 repo_dir = Path(__file__).resolve().parent
 spark_session = _get_spark_session()
+if spark_session is None:
+    raise RuntimeError(
+        "Este script requiere una sesion Spark activa de Databricks."
+    )
 default_storage_root = str(repo_dir)
 disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
 
@@ -282,7 +286,11 @@ df_ltv.head()
 
 
 #iniciamos h2o
-H2O_server = h2o.init(port=54321, nthreads=-1, max_mem_size =60) #max_mem_size considera GB si no se espefica
+H2O_server = h2o.init(
+    port=54321,
+    min_mem_size="2g",
+    max_mem_size="4g"
+)
 h2o.remove_all() 
 
 

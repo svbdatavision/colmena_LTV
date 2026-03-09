@@ -125,6 +125,19 @@ df_ges_spark = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").drop("fld_perter
 if "fld_termino" not in df_ges_spark.columns:
     raise RuntimeError("No se encontro columna fld_termino para reconstruir fld_pertermino.")
 
+# Casteo seguro para columnas numericas que pueden venir tipadas como string.
+numeric_string_targets = {
+    "id_titular": "bigint",
+    "periodo": "int",
+    "n_ges_mva_2m": "double",
+}
+current_dtypes = dict(df_ges_spark.dtypes)
+for col_name, target_type in numeric_string_targets.items():
+    if current_dtypes.get(col_name) == "string":
+        df_ges_spark = df_ges_spark.withColumn(
+            col_name, F.expr(f"try_cast(`{col_name}` as {target_type})")
+        )
+
 df_ges_spark = df_ges_spark.withColumn(
     "fld_pertermino",
     F.coalesce(
@@ -132,6 +145,7 @@ df_ges_spark = df_ges_spark.withColumn(
         F.date_format(F.to_date(F.col("fld_termino"), "yyyy/MM/dd"), "yyyyMM").cast("int"),
     ),
 )
+# Si el volumen crece, considerar filtrar por periodo antes de pasar a pandas.
 df_ges = df_ges_spark.toPandas()
 
 
