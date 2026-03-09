@@ -550,7 +550,7 @@ df[f'hay_ges_{tamaño_ventana}m'] = hay_ges
 # In[27]:
 
 
-df['fuga_5m'] = np.NaN
+df['fuga_5m'] = np.nan
 
 
 # ### Antigedad < 12 y GES = 1
