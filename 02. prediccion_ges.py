@@ -95,6 +95,23 @@ def _get_credential(env_name, prompt_label):
     )
 
 
+def _get_periodo_prediccion_param():
+    raw_value = ""
+    try:
+        dbutils.widgets.text("periodo_prediccion", "")  # type: ignore[name-defined]
+        raw_value = dbutils.widgets.get("periodo_prediccion").strip()  # type: ignore[name-defined]
+    except Exception:
+        raw_value = os.getenv("PERIODO_PREDICCION", "").strip()
+
+    if not raw_value:
+        return None
+    if not (raw_value.isdigit() and len(raw_value) == 6):
+        raise ValueError(
+            "periodo_prediccion debe tener formato YYYYMM (ejemplo: 202501)."
+        )
+    return int(raw_value)
+
+
 def _resolve_period_file(base_dir, period_tag, contains_token):
     for _, _, files in os.walk(str(base_dir)):
         for file_name in files:
@@ -141,7 +158,20 @@ snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 #assert os.getcwd() == '/estudio/data/Proyecto_GES/Prediccion'
 
 
-periodo = 'jun24'                                               #Modificar cada mes el periodo en español, en proceso 1 estan las abreviaciones
+periodo_prediccion_param = _get_periodo_prediccion_param()
+if periodo_prediccion_param is None:
+    hoy = pd.to_datetime("today")
+    fecha_prediccion = hoy - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+else:
+    periodo_prediccion = periodo_prediccion_param
+    fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
+
+num_a_mes = {
+    1: 'ene', 2: 'feb', 3: 'mar',  4: 'abr',  5: 'may',  6: 'jun',
+    7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'
+}
+periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"  # periodo en formato abreviado usado por nombres de archivos
 renta_tope = 84.3                                               #modifcar al tope en el periodo a predecir
 
 #datos del training
