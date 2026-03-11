@@ -1,52 +1,16 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# ## Preproceso para la predicción mensual
-# 
+# ## Preproceso para la prediccion mensual
 
-# In[1]:
-
-
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-import sys
-import collections
-from IPython.display import display
-import seaborn as sns
-import re
-from tqdm import tqdm_notebook as progress_bar
-from difflib import SequenceMatcher
-from itertools import combinations
 import os
+import shutil
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
-# sys.path.append('../../src')
-# from comparar_distribuciones import *
-
-# sys.path.append("../../../spike")
-# import SpikePy as sp
-
-import getpass as gp
-
-try:
-    import snowflake.connector as snow
-except Exception:
-    snow = None
-
-try:
-    from sqlalchemy import create_engine
-except Exception:
-    create_engine = None
-
-
-def _run_ipython_magic(name, value):
-    try:
-        ip = get_ipython()  # type: ignore[name-defined]
-        if ip is not None:
-            ip.run_line_magic(name, value)
-    except Exception:
-        pass
+from pyspark.sql import Window
+from pyspark.sql import functions as F
 
 
 def _get_spark_session():
@@ -55,6 +19,7 @@ def _get_spark_session():
     except Exception:
         try:
             from pyspark.sql import SparkSession
+
             return SparkSession.getActiveSession()
         except Exception:
             return None
@@ -62,504 +27,487 @@ def _get_spark_session():
 
 def _normalize_local_path(path_value):
     if path_value.startswith("dbfs:/"):
-        return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
+        return "/dbfs/" + path_value[len("dbfs:/") :].lstrip("/")
     return path_value
 
 
-def _get_secret(scope, key):
-    if not scope or not key:
-        return None
+def _to_spark_path(path_value):
+    path_str = str(path_value)
+    if path_str.startswith("dbfs:/"):
+        return path_str
+    if path_str.startswith("/dbfs/"):
+        return "dbfs:/" + path_str[len("/dbfs/") :]
+    return "file://" + path_str
+
+
+def _resolve_repo_dir():
     try:
-        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+        return Path(__file__).resolve().parent
     except Exception:
+        try:
+            nb_path = (  # type: ignore[name-defined]
+                dbutils.notebook.entry_point.getDbutils()
+                .notebook()
+                .getContext()
+                .notebookPath()
+                .get()
+            )
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
+def _get_periodo_prediccion_param():
+    raw_value = ""
+    try:
+        dbutils.widgets.text("periodo_prediccion", "")  # type: ignore[name-defined]
+        raw_value = dbutils.widgets.get("periodo_prediccion").strip()  # type: ignore[name-defined]
+    except Exception:
+        raw_value = os.getenv("PERIODO_PREDICCION", "").strip()
+
+    if not raw_value:
         return None
+    if not (raw_value.isdigit() and len(raw_value) == 6):
+        raise ValueError("periodo_prediccion debe tener formato YYYYMM (ejemplo: 202501).")
+    return int(raw_value)
 
 
-def _get_credential(env_name, prompt_label):
-    value = os.getenv(env_name)
-    if value:
-        return value
-
-    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
-    secret_key = os.getenv(f"{env_name}_KEY")
-    secret_value = _get_secret(secret_scope, secret_key)
-    if secret_value:
-        return secret_value
-
-    if sys.stdin and sys.stdin.isatty():
-        return gp.getpass(prompt=prompt_label)
-
-    raise RuntimeError(
-        f"No se encontro {env_name}. Configura variable de entorno o secreto de Databricks."
-    )
+def _read_sql_table(spark_session, table_name):
+    print(f"Leyendo {table_name} desde Spark/Databricks...")
+    return spark_session.table(table_name)
 
 
-_run_ipython_magic('matplotlib', 'inline')
-_run_ipython_magic('load_ext', 'autoreload')
-_run_ipython_magic('autoreload', '2')
-
-plt.style.use('fivethirtyeight')
-#Usar kernel spikelabs_env_3
+def _require_columns(df, required_columns, table_name):
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise RuntimeError(f"La tabla {table_name} no contiene columnas requeridas: {missing}")
 
 
-# ## Setear periodo 
-# Debiese ser el único input
-
-# In[2]:
-
-
-#periodo a predecir 'mes(3letras)año'
-hoy =  pd.to_datetime("today")
-fecha_prediccion =  hoy - pd.DateOffset(months=1, day=1)
-periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
-
-pre_ges = 0  # hubo cambio ges 5 meses antes del periodo de cierre 0 -> si no hubo cambio | 1 -> hubo cambio
-hay_ges = 0  # hay /habrá cambio ges en los 5 meses siguientes 0 -> si no habrá camnbio | 1 -> habrá cambio
+def _find_column_case_insensitive(columns, *candidates):
+    lowered = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lowered:
+            return lowered[cand.lower()]
+    return None
 
 
-num_a_mes = {
-    1: 'ene', 2: 'feb', 3: 'mar',  4: 'abr',  5: 'may',  6: 'jun',
-    7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'
-}
-periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
+def _to_lowercase_columns(df):
+    return df.select(*[F.col(c).alias(c.lower()) for c in df.columns])
 
 
-# In[3]:
+def _drop_existing_columns(df, columns_to_drop):
+    to_drop = [c for c in columns_to_drop if c in df.columns]
+    if not to_drop:
+        return df
+    return df.drop(*to_drop)
+
+
+def _write_single_csv(spark_df, target_path, compression=None):
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = target_path.parent / f".tmp_{target_path.stem}_{uuid.uuid4().hex}"
+
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    writer = spark_df.coalesce(1).write.mode("overwrite").option("header", "true")
+    if compression:
+        writer = writer.option("compression", compression)
+    writer.csv(_to_spark_path(tmp_dir))
+
+    part_files = list(tmp_dir.glob("part-*"))
+    if not part_files:
+        raise RuntimeError(f"No se genero archivo csv temporal en {tmp_dir}")
+    part_file = part_files[0]
+
+    if target_path.exists():
+        target_path.unlink()
+    shutil.move(str(part_file), str(target_path))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _resolve_ltv_file(inputs_dir, periodo):
+    override = os.getenv("GES_LTV_INPUT_FILE", "").strip()
+    if override:
+        override_path = Path(_normalize_local_path(override))
+        if not override_path.is_absolute():
+            override_path = inputs_dir / override_path
+        if not override_path.exists():
+            raise RuntimeError(
+                f"GES_LTV_INPUT_FILE apunta a un archivo inexistente: {override_path}"
+            )
+        return override_path
+
+    search_dirs = [inputs_dir, inputs_dir.parent]
+    matched_period = []
+    matched_any = []
+
+    for base_dir in search_dirs:
+        if not base_dir.exists():
+            continue
+        for root, _, files in os.walk(str(base_dir)):
+            for filename in files:
+                low = filename.lower()
+                if "ltv" not in low:
+                    continue
+                path = Path(root) / filename
+                matched_any.append(path)
+                if periodo in filename:
+                    matched_period.append(path)
+
+    candidates = matched_period if matched_period else matched_any
+    if not candidates:
+        raise RuntimeError(
+            "No se encontro archivo LTV de entrada. "
+            "Copie un archivo con 'ltv' en el nombre en input/preproceso "
+            "o configure GES_LTV_INPUT_FILE con la ruta exacta."
+        )
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _previous_month_start(dt):
+    first_day_current = dt.replace(day=1)
+    previous_month_last = first_day_current - timedelta(days=1)
+    return previous_month_last.replace(day=1)
 
 
 spark_session = _get_spark_session()
-snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
+if spark_session is None:
+    raise RuntimeError("Este script requiere una sesion Spark activa de Databricks.")
 
-
-# In[4]:
-
-
-if spark_session is not None:
-    print("Leyendo EST.P_DDV_EST.JC_GES_PRED desde Spark/Databricks...")
-    df_ges = spark_session.table("EST.P_DDV_EST.JC_GES_PRED").toPandas()
+# Periodo de ejecucion
+hoy = datetime.today()
+periodo_prediccion_param = _get_periodo_prediccion_param()
+if periodo_prediccion_param is None:
+    fecha_prediccion = _previous_month_start(hoy)
+    periodo_prediccion = fecha_prediccion.year * 100 + fecha_prediccion.month
 else:
-    if create_engine is None:
-        raise ImportError(
-            "sqlalchemy no esta disponible. Instalar dependencia o ejecutar en Databricks con Spark."
-        )
-    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario")
-    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password")
-    engine = create_engine(
-        'snowflake://{user}:{password}@{account}/'.format(
-            user=snow_user,
-            password=snow_pass,
-            account=snow_account,
+    periodo_prediccion = periodo_prediccion_param
+    year = int(str(periodo_prediccion)[:4])
+    month = int(str(periodo_prediccion)[4:6])
+    fecha_prediccion = datetime(year=year, month=month, day=1)
+
+pre_ges = 0
+hay_ges = 0
+
+num_a_mes = {
+    1: "ene",
+    2: "feb",
+    3: "mar",
+    4: "abr",
+    5: "may",
+    6: "jun",
+    7: "jul",
+    8: "ago",
+    9: "sep",
+    10: "oct",
+    11: "nov",
+    12: "dic",
+}
+periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
+
+# Paths y tablas
+repo_dir = _resolve_repo_dir()
+default_storage_root = os.getenv("GES_STORAGE_ROOT", "/dbfs/tmp/modelo_ltv")
+inputs = Path(
+    _normalize_local_path(
+        os.getenv(
+            "GES_PREPROCESO_INPUT_DIR",
+            os.path.join(default_storage_root, "input", "preproceso"),
         )
     )
-    connection = None
-    try:
-        connection = engine.connect()
-        results = connection.execute('select current_version()').fetchone()
-        print(results[0])
-        df_ges = pd.read_sql('SELECT * FROM EST.P_DDV_EST.JC_GES_PRED;', con=engine)
-    finally:
-        if connection is not None:
-            connection.close()
-        engine.dispose()
-
-
-# In[5]:
-
-
-repo_dir = Path(__file__).resolve().parent
-default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
-disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
-inputs = Path(_normalize_local_path(
-    os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))
-))
-outputs = Path(_normalize_local_path(
-    os.getenv("GES_OUTPUT_DIR", str(repo_dir / "output"))
-))
-in_pred = Path(_normalize_local_path(
-    os.getenv("GES_PREDICCION_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/prediccion")
-))
+)
+outputs = Path(
+    _normalize_local_path(os.getenv("GES_OUTPUT_DIR", os.path.join(default_storage_root, "output")))
+)
+in_pred = Path(
+    _normalize_local_path(
+        os.getenv(
+            "GES_PREDICCION_INPUT_DIR",
+            os.path.join(default_storage_root, "input", "prediccion"),
+        )
+    )
+)
 
 inputs.mkdir(parents=True, exist_ok=True)
 outputs.mkdir(parents=True, exist_ok=True)
 in_pred.mkdir(parents=True, exist_ok=True)
 
-nombre_archivo = f'{hoy:%y.%m.%d}_GES_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}.gz'
+aux_schema = os.getenv("GES_AUX_SQL_SCHEMA", "EST.P_DDV_EST").strip() or "EST.P_DDV_EST"
+table_prm_categoria = os.getenv("GES_SQL_TABLE_PRM_CATEGORIA", f"{aux_schema}.PRM_CATEGORIA")
+table_division_regiones = os.getenv(
+    "GES_SQL_TABLE_DIVISION_REGIONES", f"{aux_schema}.DIVISION_REGIONES"
+)
+table_cod_comuna = os.getenv("GES_SQL_TABLE_COD_COMUNA", f"{aux_schema}.COD_COMUNA")
+table_nse_y_pobreza = os.getenv("GES_SQL_TABLE_NSE_Y_POBREZA", f"{aux_schema}.NSE_Y_POBREZA")
+table_ltv_input = os.getenv("GES_SQL_TABLE_LTV_INPUT", f"{aux_schema}.JC_PRED_LTV_INPUT")
+
+# GES base desde Spark
+df_ges_spark = _read_sql_table(spark_session, "EST.P_DDV_EST.JC_GES_PRED")
+if "fld_pertermino" in df_ges_spark.columns:
+    df_ges_spark = df_ges_spark.drop("fld_pertermino")
+if "fld_termino" not in df_ges_spark.columns:
+    raise RuntimeError("No se encontro columna fld_termino para reconstruir fld_pertermino.")
+
+numeric_string_targets = {
+    "id_titular": "bigint",
+    "periodo": "int",
+    "n_ges_mva_2m": "double",
+}
+current_dtypes = dict(df_ges_spark.dtypes)
+for col_name, target_type in numeric_string_targets.items():
+    if current_dtypes.get(col_name) == "string":
+        df_ges_spark = df_ges_spark.withColumn(
+            col_name, F.expr(f"try_cast(`{col_name}` as {target_type})")
+        )
+
+df_ges_spark = df_ges_spark.withColumn(
+    "fld_pertermino",
+    F.coalesce(
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'MM/dd/yyyy'), 'yyyyMM') as int)"),
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'dd/MM/yyyy'), 'yyyyMM') as int)"),
+        F.expr("cast(date_format(try_to_date(`fld_termino`, 'yyyy/MM/dd'), 'yyyyMM') as int)"),
+    ),
+)
+
+nombre_archivo = (
+    f"{hoy:%y.%m.%d}_GES_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}"
+    f"{fecha_prediccion:%y}.gz"
+)
 ges_file = inputs / nombre_archivo
-df_ges.to_csv(ges_file, index=False, compression='gzip')
-
-
-# In[6]:
-
-
-#shift periodo
-p = {'ene':'01','feb':'02','mar':'03','abr':'04','may':'05','jun':'06',
-     'jul':'07','ago':'08','sep':'09','oct':'10','nov':'11','dic':'12'}
-
-per = p[periodo[:3]]
-
-t = str(int(per)%12+1)
-
-if len(t) == 1:
-    next_per = '0'+t
-else:
-    next_per = t        
-
-if periodo[:3] == 'dic':
-    agno = str(int(periodo[3:])+1)
-else:
-    agno = periodo[3:]
-
-
-# In[7]:
-
-
-#todos los archivos necesarios
-# Los directorios ya fueron definidos de forma portable para Databricks.
-
-# print('Buscando los datos de ges del periodo...')
-
-# temp_ges = []
-
-# for root, subdirs, files in os.walk(inputs):
-#      for filename in files:
-#             if 'ges' in filename.lower():
-#                 if periodo in filename:
-#                     temp_ges.append(filename)
-# try:
-#     print('Los archivos encontrados son:...')
-
-#     print(*temp_ges,sep='\n')
-    
-#     print(f'Se utilizara el archivo {temp_ges[0]} para el preproceso')
-    
-#     ges = temp_ges[0]
-    
-# except IndexError:
-#     print('No hay archivos en el periodo, buscando en todos los periodos...')
-
-#     for root, subdirs, files in os.walk('input'):
-#          for filename in files:
-#                 if 'ges' in filename.lower():
-#                         temp_ges.append(filename)
-#     print('Los archivos son:')
-    
-#     print(*temp_ges,sep='\n')
-    
-#     print('Modifique más abajo el archivo que desea utilizar')
-
-ges = str(ges_file)
-
-
-# In[8]:
-
-
-print('Buscando los datos de ltv del periodo...')
-
-temp_ltv = []
-
-for root, subdirs, files in os.walk(str(inputs)):
-     for filename in files:
-            if 'ltv' in filename.lower():
-                if periodo in filename:
-                    temp_ltv.append(filename)
-try:
-    print('Los archivos encontrados son:...')
-
-    print(*temp_ltv,sep='\n')
-    
-    print(f'Se utilizara el archivo {temp_ltv[0]} para el preproceso')
-    
-    ltv = temp_ltv[0]
-    
-except IndexError:
-    print('No hay archivos en el periodo, buscando en todos los periodos...')
-
-    for root, subdirs, files in os.walk(str(inputs.parent)):
-         for filename in files:
-                if 'ges' in filename.lower():
-                        temp_ltv.append(filename)
-    print('Los archivos son:')
-    
-    print(*temp_ltv,sep='\n')
-    
-    print('Modifique más abajo el archivo que desea utilizar')
-
-
-# In[9]:
-
-
-#datos auxiliares
-div_reg = 'xlsx/Division Regiones.xlsx'
-comunas = 'xlsx/cod comuna.xlsx'
-pobreza = 'xlsx/nse_y_pobreza.xlsx'
-
-
-# In[10]:
-
-
-#cargamos datos ltv
-df_ltv =  pd.read_csv(inputs / ltv, sep=",", compression='gzip').rename(columns = lambda x: x.lower())
-df_ltv['periodo'] = pd.to_datetime(df_ltv['periodo'], format='%Y%m')
-# df_ltv.head()
-
-
-# In[11]:
-
-
-df_ltv.head()
-
-
-# In[12]:
-
-
-#cargamos datos ges, solo algunas columnas
-cols_to_use = ['id_titular','periodo','fld_pertermino','n_ges_mva_2m',
-               'preexistencia_afi','preexistencia_car','gls_isapreant']
-
-# df_ges = df pd.read_csv(inputs+ges, compression='zip') #usecols=cols_to_use,delimiter=';',
-
-
-# In[13]:
-
-
-#generamos la variable huerfano y formateamos
-df_ges['huerfano'] = ((df_ges['fld_pertermino'] < df_ges['periodo']) & (df_ges['fld_pertermino'] != 190001))
-df_ges['periodo'] = pd.to_datetime(df_ges['periodo'], format='%Y%m')  #
-# df_ges['periodo'] = (df_ges['periodo'] + pd.Timedelta('32 day')).apply(lambda f: f.replace(day=1))
-df_ges = df_ges.rename(columns=lambda x: x.lower())
-df_ges = df_ges.dropna(subset=['fld_pertermino'])
-df_ges = df_ges.drop(['fld_pertermino'], axis=1)
-
-
-# In[14]:
-
-
-df_ges.head()
-
-
-# In[15]:
-
-
-#merge
-df = pd.merge(df_ltv, df_ges, how='left', on=['periodo', 'id_titular'])
-
-
-# #### Shiftear periodos Fuga y VN
-
-# In[16]:
-
-
-fugas = df.tipo_transac.isin(['D2', 'D3'])
-index_fugas = fugas[fugas].index
-periodos_fuga = df.loc[index_fugas, 'periodo']
-df.loc[index_fugas, 'periodo'] = (periodos_fuga - pd.Timedelta('1 day')).apply(lambda f: f.replace(day=1))
-df = df[df.renta_imponible >= 0]
-df = df.drop(['anno', 'mes', 'fechaingreso'], axis=1)
-
-
-# ### Datos preferente
-
-# In[17]:
-
-
-def cat_linea_plan(x):
-    for c, lst in categorias.items():
-        if x in lst:
-            return c
-        
-alto = ['CLINICA ALEMANA', 'CLINICA LAS CONDES', 'LOS ANDES', 'SAN CARLOS', 'ALEMANA-SC-LA-CSM / CLC', 
-        'SAN CARLOS - LOS ANDES', 'SAN CARLOS - UC - LOS ANDES', 'BALTICO', 'SAN CARLOS - STA. MARIA - LOS ANDES',
-        'ADRIATICO', 'SAN CARLOS-UC']
-medio = ['SANTA MARIA', 'HOSP. CLINICO UNIVERSIDAD CATOLICA', 'CLINICA UNIVERSIDAD CATOLICA', 'TABANCURA', 
-         'MEDITERRANEO', 'SAN CARLOS-UC', 'HOSP.CLINICO UNIVERSIDAD DE CHILE', 'INDISA INSTITUCIONAL', 'CLINICA INDISA']
-bajo = ['DAVILA', 'BICENTENARIO-VESPUCIO-LAS LILAS',  
-        'UC SJ 110 - BICENTENARIO - VESPUCIO', 'CORDILL.-BICENT.-AVANSALUD-SERVET', 'BICENTENARIO-TABANCURA-DAVILA', 
-        'CITY COLMENA', 'BICENTENARIO-VESPUCIO', 'CLINICA CORDILLERA - CLINICA DAVILA', 
-        'UC SJ - BICENTENARIO - VESPUCIO']
-le = ['LIBRE ELECCION']
-
-categorias = {'alto': alto, 'medio': medio, 'bajo': bajo, 'le': le}
-
-
-# In[18]:
-
-
-#demora 1 min
-cat = 'xlsx/PRM_Categoria.xlsx'
-categoria = pd.read_excel(inputs / cat)
-df = pd.merge(df, categoria[['cod_categoria', 'preferente']], how='left', 
-                 left_on='categoria_cod', right_on='cod_categoria')
-df['cat_linea_plan'] = df.preferente.apply(cat_linea_plan)
-
-titulares = df.id_titular.unique()
-
-
-# In[19]:
-
-
-replace_pref = {'UC ': 'UNIVERSIDAD CATOLICA',
-                'CSM': 'STA. MARIA',
-                'CLC': 'CLINICA LAS CONDES',
-                'BICENT.': 'BICENTENARIO',
-                'CORDILL.': 'CLINICA CORDILLERA'}
-
-
-# In[20]:
-
-
-def limpiar_preferente(x):
-    y = x
-    for old, new in replace_pref.items():
-        try:
-            y = y.replace(old, new)
-        except:
-            pass
-    return y
-
-
-# In[21]:
-
-
-df.preferente = df.preferente.apply(limpiar_preferente)
-
-
-# ### Datos Democráficos Extras
-
-# In[22]:
-
-
-# demora 
-division_reg = (pd.read_excel(inputs / div_reg, skiprows=1)
-                [19::].rename(columns={'Unnamed: 3': 'norte_centro_sur'})
-               [['COD_REGION', 'GLS_WEB_REGION', 'norte_centro_sur']])
-division_reg['COD_REGION'] = division_reg.COD_REGION.astype('int')
-
-cod_comuna = pd.read_excel(inputs / comunas)
-nse_y_pobreza = pd.read_excel(inputs / pobreza)
-
-nse_y_pobreza = pd.merge(nse_y_pobreza, cod_comuna, how='inner',
-                        left_on='COMUNA', right_on='con_comuna_gls')
-nse_y_pobreza['COD_REGION'] = nse_y_pobreza.cod_comuna.astype('str').str[:-3].astype('int')
-full_comuna = pd.merge(nse_y_pobreza, division_reg, how='left',
-                      on='COD_REGION')
-
-#Asumiendo que tu base se llama df_res y tiene la variable `comuna_cod`
-df = pd.merge(df, full_comuna, how='left',
-                      left_on='comuna_cod', right_on='cod_comuna')
-
-
-# ### Drop y limpieza 
-
-# In[23]:
-
-
-df = df.rename(columns={'categoria_gls': 'categor__a_gls'})
-
-
-# In[24]:
-
-
-drop = ['region_cod', 'comuna_cod', 'fecha_nacimiento', 'cod_sucursal', 'centrocostos_cod', 
-        'detalle_producto', 'cod_categoria', 'con_comuna_gls', 'cod_comuna', 'COD_REGION',
-        'GLS_WEB_REGION', 'comuna_gls']
-df = df.drop(drop, axis=1)
-
-
-# In[25]:
-
-
-cols_strip = ['region_gls', 'sucursal_gls', 'categor__a_gls', 'serie', 'tipo_plan', 'tipo_producto', 'actividad']
-for col in cols_strip:
-    df.loc[:, col] = df[col].str.rstrip()
-
-
-# ## Generar Features
-
-# ### Variable categórica de ges y pre-ges en ventana de tiempo
-# Setear en función de si habrá annuncio de alza por precio ges y (pre_ges)
-# y apertura de cartera por cambio (ges) en una ventana de tiempo (meses)
-
-# In[26]:
-
-
-tamaño_ventana = 5 #meses a futuro
-df[f'hay_preges_{tamaño_ventana}m'] = pre_ges
-df[f'hay_ges_{tamaño_ventana}m'] = hay_ges
-
-
-# ### Variable categórica de Fuga Voluntaria en ventana de tiempo
-# variable de entrenamient
-
-# In[27]:
-
-
-df['fuga_5m'] = np.NaN
-
-
-# ### Antigedad < 12 y GES = 1
-
-# In[28]:
-
-
-df['ant_m12_y_ges'] = (df.antiguedad <= 12 - tamaño_ventana)
-
-
-# ### Tuvo CIE complejo, tuvo gasto licencia
-
-# In[29]:
-
-
-#propagar variables 
-var = 'cie_complejo'
-var_new = 'hubo_cie_complejo'
-df_aux = df[['id_titular', 'periodo', var]]
-df_aux = pd.pivot_table(df_aux, index='periodo', values=var, 
-                               columns='id_titular', aggfunc=np.max)
-df_aux = df_aux.sort_index().fillna(0)
-df_aux = df_aux.rolling(window=100, min_periods=1).max()
-df_aux = df_aux.stack().reset_index().rename(columns={0: var_new})
-df = pd.merge(df, df_aux, how='left', on=['id_titular', 'periodo'])
-
-
-# In[30]:
-
-
-df['hay_gasto_licencia'] = ((df.gasto_licencias != 0) | (df.gasto_licencias_excl != 0)) + 0
-
-var = 'hay_gasto_licencia'
-var_new = 'hubo_licencia'
-df_aux = df[['id_titular', 'periodo', var]]
-df_aux = pd.pivot_table(df_aux, index='periodo', values=var, 
-                               columns='id_titular', aggfunc=np.max)
-df_aux = df_aux.sort_index().fillna(0)
-df_aux = df_aux.rolling(window=100, min_periods=1).max()
-df_aux = df_aux.stack().reset_index().rename(columns={0: var_new})
-datos = pd.merge(df, df_aux, how='left', on=['id_titular', 'periodo'])
-
-
-# In[31]:
-
-
-f = f'ready_to_pred_{periodo}.csv'
-#df.to_csv(outputs + f) dejo solamente la copia para la predicción, no tiene sentido estar duplicando este archivo
-df.to_csv(in_pred / f) #apunta la carperta de inputs para la predicción
-
-
-# In[32]:
-
-
-df.shape
-
-
-# In[33]:
-
-
-print(df.n_ges_mva_2m.unique())
-df.n_ges_mva_2m.head()
-
-
-# In[ ]:
-
-
-
-
+_write_single_csv(df_ges_spark, ges_file, compression="gzip")
+
+# LTV input desde Spark a archivo local solo si no existe
+nombre_archivo_ltv = (
+    f"{hoy:%y.%m.%d}_LTV_{fecha_prediccion:%Y%m}_{num_a_mes[fecha_prediccion.month]}"
+    f"{fecha_prediccion:%y}.gz"
+)
+ltv_file = inputs / nombre_archivo_ltv
+if not ltv_file.exists():
+    ltv_source = _read_sql_table(spark_session, table_ltv_input)
+    _write_single_csv(ltv_source, ltv_file, compression="gzip")
+
+# Lee LTV para el periodo
+print("Buscando los datos de ltv del periodo...")
+ltv_path = _resolve_ltv_file(inputs, periodo)
+print(f"Se utilizara el archivo {ltv_path.name} para el preproceso")
+
+df_ltv = (
+    spark_session.read.option("header", "true")
+    .option("inferSchema", "true")
+    .csv(_to_spark_path(ltv_path))
+)
+df_ltv = _to_lowercase_columns(df_ltv)
+_require_columns(df_ltv, ["id_titular", "periodo"], str(ltv_path))
+df_ltv = df_ltv.withColumn("periodo", F.to_date(F.col("periodo").cast("string"), "yyyyMM"))
+
+df_ges = _to_lowercase_columns(df_ges_spark)
+df_ges = df_ges.withColumn(
+    "huerfano",
+    (F.col("fld_pertermino") < F.col("periodo")) & (F.col("fld_pertermino") != F.lit(190001)),
+)
+df_ges = df_ges.withColumn("periodo", F.to_date(F.col("periodo").cast("string"), "yyyyMM"))
+df_ges = df_ges.filter(F.col("fld_pertermino").isNotNull()).drop("fld_pertermino")
+
+# Merge principal
+df = df_ltv.join(df_ges, on=["periodo", "id_titular"], how="left")
+
+# Shift periodo para fugas
+df = df.withColumn(
+    "periodo",
+    F.when(F.col("tipo_transac").isin(["D2", "D3"]), F.add_months(F.col("periodo"), -1)).otherwise(
+        F.col("periodo")
+    ),
+)
+df = df.filter(F.col("renta_imponible") >= 0)
+df = _drop_existing_columns(df, ["anno", "mes", "fechaingreso"])
+
+# Datos preferente
+alto = [
+    "CLINICA ALEMANA",
+    "CLINICA LAS CONDES",
+    "LOS ANDES",
+    "SAN CARLOS",
+    "ALEMANA-SC-LA-CSM / CLC",
+    "SAN CARLOS - LOS ANDES",
+    "SAN CARLOS - UC - LOS ANDES",
+    "BALTICO",
+    "SAN CARLOS - STA. MARIA - LOS ANDES",
+    "ADRIATICO",
+    "SAN CARLOS-UC",
+]
+medio = [
+    "SANTA MARIA",
+    "HOSP. CLINICO UNIVERSIDAD CATOLICA",
+    "CLINICA UNIVERSIDAD CATOLICA",
+    "TABANCURA",
+    "MEDITERRANEO",
+    "SAN CARLOS-UC",
+    "HOSP.CLINICO UNIVERSIDAD DE CHILE",
+    "INDISA INSTITUCIONAL",
+    "CLINICA INDISA",
+]
+bajo = [
+    "DAVILA",
+    "BICENTENARIO-VESPUCIO-LAS LILAS",
+    "UC SJ 110 - BICENTENARIO - VESPUCIO",
+    "CORDILL.-BICENT.-AVANSALUD-SERVET",
+    "BICENTENARIO-TABANCURA-DAVILA",
+    "CITY COLMENA",
+    "BICENTENARIO-VESPUCIO",
+    "CLINICA CORDILLERA - CLINICA DAVILA",
+    "UC SJ - BICENTENARIO - VESPUCIO",
+]
+le = ["LIBRE ELECCION"]
+
+categoria = _to_lowercase_columns(_read_sql_table(spark_session, table_prm_categoria))
+_require_columns(categoria, ["cod_categoria", "preferente"], table_prm_categoria)
+df = df.join(
+    categoria.select("cod_categoria", "preferente"),
+    df["categoria_cod"] == categoria["cod_categoria"],
+    how="left",
+)
+
+df = df.withColumn(
+    "cat_linea_plan",
+    F.when(F.col("preferente").isin(alto), F.lit("alto"))
+    .when(F.col("preferente").isin(medio), F.lit("medio"))
+    .when(F.col("preferente").isin(bajo), F.lit("bajo"))
+    .when(F.col("preferente").isin(le), F.lit("le"))
+    .otherwise(F.lit(None)),
+)
+
+replace_pref = {
+    "UC ": "UNIVERSIDAD CATOLICA",
+    "CSM": "STA. MARIA",
+    "CLC": "CLINICA LAS CONDES",
+    "BICENT.": "BICENTENARIO",
+    "CORDILL.": "CLINICA CORDILLERA",
+}
+for old, new in replace_pref.items():
+    df = df.withColumn(
+        "preferente",
+        F.when(F.col("preferente").isNotNull(), F.replace(F.col("preferente"), old, new)).otherwise(
+            F.col("preferente")
+        ),
+    )
+
+# Datos demograficos extras
+division_raw = _read_sql_table(spark_session, table_division_regiones)
+cod_region_col = _find_column_case_insensitive(division_raw.columns, "COD_REGION", "cod_region")
+gls_region_col = _find_column_case_insensitive(
+    division_raw.columns, "GLS_WEB_REGION", "gls_web_region"
+)
+norte_col = _find_column_case_insensitive(
+    division_raw.columns, "norte_centro_sur", "NORTE_CENTRO_SUR", "Unnamed: 3"
+)
+if not cod_region_col or not gls_region_col or not norte_col:
+    raise RuntimeError(
+        f"La tabla {table_division_regiones} no contiene columnas esperadas para regiones."
+    )
+
+division_reg = (
+    division_raw.select(
+        F.col(cod_region_col).cast("int").alias("COD_REGION"),
+        F.col(gls_region_col).alias("GLS_WEB_REGION"),
+        F.col(norte_col).alias("norte_centro_sur"),
+    )
+    .filter(F.col("COD_REGION").isNotNull())
+    .dropDuplicates(["COD_REGION"])
+)
+
+cod_comuna_raw = _read_sql_table(spark_session, table_cod_comuna)
+con_comuna_col = _find_column_case_insensitive(cod_comuna_raw.columns, "con_comuna_gls")
+cod_comuna_col = _find_column_case_insensitive(cod_comuna_raw.columns, "cod_comuna")
+if not con_comuna_col or not cod_comuna_col:
+    raise RuntimeError(f"La tabla {table_cod_comuna} no contiene con_comuna_gls/cod_comuna.")
+cod_comuna = cod_comuna_raw.select(
+    F.col(con_comuna_col).alias("con_comuna_gls"),
+    F.col(cod_comuna_col).alias("cod_comuna"),
+)
+
+nse_raw = _read_sql_table(spark_session, table_nse_y_pobreza)
+comuna_col = _find_column_case_insensitive(nse_raw.columns, "COMUNA", "comuna")
+if not comuna_col:
+    raise RuntimeError(f"La tabla {table_nse_y_pobreza} no contiene columna COMUNA/comuna.")
+if comuna_col != "COMUNA":
+    nse_raw = nse_raw.withColumnRenamed(comuna_col, "COMUNA")
+
+nse_y_pobreza = nse_raw.join(
+    cod_comuna, nse_raw["COMUNA"] == cod_comuna["con_comuna_gls"], how="inner"
+).withColumn(
+    "COD_REGION",
+    F.expr("cast(substr(cast(cod_comuna as string), 1, length(cast(cod_comuna as string)) - 3) as int)"),
+)
+full_comuna = nse_y_pobreza.join(division_reg, on="COD_REGION", how="left")
+df = df.join(full_comuna, df["comuna_cod"] == full_comuna["cod_comuna"], how="left")
+
+# Limpieza
+if "categoria_gls" in df.columns:
+    df = df.withColumnRenamed("categoria_gls", "categor__a_gls")
+
+drop_cols = [
+    "region_cod",
+    "comuna_cod",
+    "fecha_nacimiento",
+    "cod_sucursal",
+    "centrocostos_cod",
+    "detalle_producto",
+    "cod_categoria",
+    "con_comuna_gls",
+    "cod_comuna",
+    "COD_REGION",
+    "GLS_WEB_REGION",
+    "comuna_gls",
+]
+df = _drop_existing_columns(df, drop_cols)
+
+cols_strip = [
+    "region_gls",
+    "sucursal_gls",
+    "categor__a_gls",
+    "serie",
+    "tipo_plan",
+    "tipo_producto",
+    "actividad",
+]
+for col_name in cols_strip:
+    if col_name in df.columns:
+        df = df.withColumn(col_name, F.rtrim(F.col(col_name)))
+
+# Features
+tamaño_ventana = 5
+df = df.withColumn(f"hay_preges_{tamaño_ventana}m", F.lit(pre_ges))
+df = df.withColumn(f"hay_ges_{tamaño_ventana}m", F.lit(hay_ges))
+df = df.withColumn("fuga_5m", F.lit(None).cast("double"))
+df = df.withColumn("ant_m12_y_ges", F.col("antiguedad") <= F.lit(12 - tamaño_ventana))
+
+window_hist = (
+    Window.partitionBy("id_titular")
+    .orderBy("periodo")
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+df = df.withColumn(
+    "hubo_cie_complejo",
+    F.max(F.coalesce(F.col("cie_complejo"), F.lit(0))).over(window_hist),
+)
+df = df.withColumn(
+    "hay_gasto_licencia",
+    ((F.col("gasto_licencias") != 0) | (F.col("gasto_licencias_excl") != 0)).cast("int"),
+)
+df = df.withColumn("hubo_licencia", F.max(F.col("hay_gasto_licencia")).over(window_hist))
+datos = df
+
+# Export a csv consumible por el script de prediccion
+f = f"ready_to_pred_{periodo}.csv"
+ready_path = in_pred / f
+index_window = Window.orderBy(F.monotonically_increasing_id())
+df_to_write = df.withColumn("index", F.row_number().over(index_window) - F.lit(1))
+ordered_cols = ["index"] + [c for c in df_to_write.columns if c != "index"]
+_write_single_csv(df_to_write.select(*ordered_cols), ready_path)
+
+print((df.count(), len(df.columns)))
+if "n_ges_mva_2m" in df.columns:
+    df.select("n_ges_mva_2m").distinct().show(50, truncate=False)
+    df.select("n_ges_mva_2m").show(5, truncate=False)
