@@ -28,14 +28,12 @@
 import time
 import os
 import sys
+import shutil
 from pathlib import Path
 from numba import njit, prange
 import pandas as pd
 import json
-try:
-    import great_expectations as ge
-except Exception:
-    ge = None
+import great_expectations as ge
 import numpy as np
 import h2o
 import re
@@ -45,6 +43,12 @@ try:
 except Exception:
     bigquery = None
 np.random.seed(54321)
+
+try:
+    import snowflake.connector as snow_con
+except Exception:
+    snow_con = None
+import getpass as gp
 
 # import feather
 try:
@@ -91,6 +95,34 @@ def _get_spark_session():
             return None
 
 
+def _get_secret(scope, key):
+    if not scope or not key:
+        return None
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+    except Exception:
+        return None
+
+
+def _get_credential(env_name, prompt_label):
+    value = os.getenv(env_name)
+    if value:
+        return value
+
+    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
+    secret_key = os.getenv(f"{env_name}_KEY")
+    secret_value = _get_secret(secret_scope, secret_key)
+    if secret_value:
+        return secret_value
+
+    if sys.stdin and sys.stdin.isatty():
+        return gp.getpass(prompt_label)
+
+    raise RuntimeError(
+        f"No se encontro {env_name}. Configura variable de entorno o secreto en Databricks."
+    )
+
+
 def _get_periodo_prediccion_param():
     raw_value = ""
     try:
@@ -122,9 +154,8 @@ pd.set_option('display.max_columns',2000)
 #1. Ubicación de datos y nombre de proyecto (Varía entre Colmena y Spike)
 ###########################################################
 pid = "estudios-242917"
-repo_dir = _resolve_repo_dir()
 spark_session = _get_spark_session()
-default_ltv_base = str(repo_dir / "ltv")
+default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
 carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
 carpeta_ltv = f"{carpeta_ltv_path.as_posix()}/"
 datos_ltv_folder = f"{(carpeta_ltv_path / 'Input').as_posix()}/"
@@ -142,8 +173,8 @@ for required_dir in [
 #periodo_de_prediccion = '202201' #añomes. p.ej'201905'
 periodo_prediccion_param = _get_periodo_prediccion_param()
 if periodo_prediccion_param is None:
-    fecha_prediccion =  pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
-    periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+    fecha_prediccion = pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year * 100 + fecha_prediccion.month
 else:
     periodo_prediccion = periodo_prediccion_param
     fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
@@ -203,15 +234,40 @@ print(nombre_tabla, nombre_base_consolidada, nombre_ltv_new_mes_anterior, nombre
 # In[ ]:
 
 
+snow_user = os.getenv("SNOWFLAKE_USER")
+snow_pass = os.getenv("SNOWFLAKE_PASSWORD")
+snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
+snow_warehouse = "P_OPX"
 
 
-if spark_session is None:
-    raise RuntimeError(
-        "Este script requiere una sesion Spark activa de Databricks."
-    )
-print("Leyendo EST.P_DDV_EST.JC_PRED_LTV_INPUT desde Spark/Databricks...")
-# Si el volumen crece, considerar filtrar por periodo antes de pasar a pandas.
-data_ltv_snow = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT").toPandas()
+# In[ ]:
+
+
+
+
+if spark_session is not None:
+    print("Leyendo EST.P_DDV_EST.JC_PRED_LTV_INPUT desde Spark/Databricks...")
+    data_ltv_snow = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT").toPandas()
+else:
+    if snow_con is None:
+        raise ImportError(
+            "snowflake-connector-python no esta disponible. Ejecuta en Databricks con Spark o instala la libreria."
+        )
+    if not snow_user:
+        snow_user = _get_credential("SNOWFLAKE_USER", "snow_user")
+    if not snow_pass:
+        snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "snow_pass")
+
+    snow = snow_con.connect(user=snow_user,
+                            password=snow_pass,
+                            account=snow_account,
+                            warehouse=snow_warehouse
+                            )
+    with snow.cursor() as cur:
+        print(f"{periodo_prediccion}")
+        cur.execute(f"SET (per_desde, per_hasta) = ({periodo_prediccion}, {periodo_prediccion}); ")
+        cur.execute('SELECT * FROM EST.P_DDV_EST.JC_PRED_LTV_INPUT;')
+        data_ltv_snow = cur.fetch_pandas_all()
 
 data_ltv_snow.to_csv(datos_ltv_folder + nombre_base, index=False, compression='gzip')
 
@@ -271,11 +327,7 @@ print("Ok")
 # In[ ]:
 
 
-h2o.init(
-    port=54321,
-    min_mem_size="2g",
-    max_mem_size="4g"
-)
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 h2o.remove_all()
 
 
@@ -551,28 +603,26 @@ df.drop(labels=['sexo'], axis=1, inplace=True)
 # Acá se hace check de Great Expectations intermedio
 df.to_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv')
 
-if ge is not None:
-    with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
-        my_expectations_config = json.load(f)
+with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
+    my_expectations_config = json.load(f)
 
-    #El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script
-    my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
+#El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script    
 
-    # Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
-    my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
-    my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
-    my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
-    my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
-    my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
+my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
 
-    resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
+# Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
+my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
+my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
+my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
+my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
+my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
 
-    with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
-        json.dump(resultado, outfile)
-        
-    print("Guardado!")
-else:
-    print("great_expectations no disponible: se omite validacion intermedia.")
+resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
+
+with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
+    json.dump(resultado, outfile)
+    
+print("Guardado!")
 
 #assert resultado['success']
 
@@ -888,6 +938,8 @@ ltv_table_name = f"LTV.PREDICCION_MODULOS_LTV_{nombre_fancy}"
 
 #Liberamos memoria de los procesos de h2o
 h2o.remove_all()
+h2o.shutdown()
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 
 
 # In[ ]:
@@ -1079,7 +1131,7 @@ df_p.to_csv("../../df_p.csv")
 
 
 import gc
-h2o.remove_all()
+h2o.cluster().shutdown()
 del df_p
 time.sleep(15)
 gc.collect()
@@ -1090,6 +1142,7 @@ time.sleep(25)
 
 
 # De nuevo para asegurarse de que la memoria esté disponible
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 h2o.remove_all()
 
 model = h2o.load_model(path=f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5')
@@ -1125,6 +1178,17 @@ nombre_fancy
 csv_name = f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv'
 #df_ltv.to_pickle(f'/home/ubuntu/spike/LTV3/Output/prediccion_ltv_con_categoria_{fancy_name}.pkl')
 df_ltv.to_csv(csv_name, index = False)
+repo_dir = _resolve_repo_dir()
+ges_pred_input_dir = Path(_normalize_local_path(
+    os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
+))
+ges_pred_input_dir.mkdir(parents=True, exist_ok=True)
+target_prediccion_ltv = ges_pred_input_dir / Path(csv_name).name
+if Path(csv_name).resolve() != target_prediccion_ltv.resolve():
+    shutil.copy2(csv_name, target_prediccion_ltv)
+    print(f"Archivo prediccion_ltv copiado a {target_prediccion_ltv}")
+else:
+    print(f"Archivo prediccion_ltv ya esta en {target_prediccion_ltv}")
 
 ltv_table_name = f"LTV.PREDICCION_LTV_CATLTV_{nombre_fancy}"
 #!bq --location=US load --autodetect --replace --source_format=CSV {ltv_table_name} "{csv_name}"
@@ -1149,21 +1213,18 @@ tiempo_transcurrido = (end - start)/60
 
 ## Acá se hace check de Great Expectations final (output)
 
-if ge is not None:
-    with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
-        my_expectations_config = json.load(f)
+with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
+    my_expectations_config = json.load(f)
 
-    my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
-                        
-    resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
+my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
+                    
+resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
 
-    with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
-              'w') as outfile:
-        json.dump(resultado_output, outfile)
+with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
+          'w') as outfile:
+    json.dump(resultado_output, outfile)
 
-    print("Guardado!")
-else:
-    print("great_expectations no disponible: se omite validacion final.")
+print("Guardado!")
 
 #assert resultado_output['success']
 

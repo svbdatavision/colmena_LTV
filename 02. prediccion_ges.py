@@ -21,7 +21,18 @@ warnings.filterwarnings('ignore')
 import json
 import tqdm
 
+import getpass as gp
+
 import sys
+try:
+    from snowflake.connector.pandas_tools import pd_writer
+except Exception:
+    pd_writer = None
+
+try:
+    from sqlalchemy import create_engine
+except Exception:
+    create_engine = None
 
 try:
     from IPython.core.display import display, HTML
@@ -45,17 +56,6 @@ def _normalize_local_path(path_value):
     return path_value
 
 
-def _resolve_repo_dir():
-    try:
-        return Path(__file__).resolve().parent
-    except Exception:
-        try:
-            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
-            return Path(f"/Workspace{nb_path}").resolve().parent
-        except Exception:
-            return Path.cwd()
-
-
 def _get_spark_session():
     try:
         return spark  # type: ignore[name-defined]
@@ -65,6 +65,53 @@ def _get_spark_session():
             return SparkSession.getActiveSession()
         except Exception:
             return None
+
+
+def _get_secret(scope, key):
+    if not scope or not key:
+        return None
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)  # type: ignore[name-defined]
+    except Exception:
+        return None
+
+
+def _get_credential(env_name, prompt_label):
+    value = os.getenv(env_name)
+    if value:
+        return value
+
+    secret_scope = os.getenv("SNOWFLAKE_SECRET_SCOPE")
+    secret_key = os.getenv(f"{env_name}_KEY")
+    secret_value = _get_secret(secret_scope, secret_key)
+    if secret_value:
+        return secret_value
+
+    if sys.stdin and sys.stdin.isatty():
+        return gp.getpass(prompt=prompt_label)
+
+    raise RuntimeError(
+        f"No se encontro {env_name}. Configura variable de entorno o secreto en Databricks."
+    )
+
+
+def _resolve_period_file(base_dir, period_tag, contains_token):
+    for _, _, files in os.walk(str(base_dir)):
+        for file_name in files:
+            if period_tag in file_name and contains_token in file_name.lower():
+                return file_name
+    return None
+
+
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
 
 
 def _get_periodo_prediccion_param():
@@ -84,11 +131,18 @@ def _get_periodo_prediccion_param():
     return int(raw_value)
 
 
-def _resolve_period_file(base_dir, period_tag, contains_token):
-    for _, _, files in os.walk(str(base_dir)):
-        for file_name in files:
-            if period_tag in file_name and contains_token in file_name.lower():
-                return file_name
+def _resolve_period_file_path(base_dir, period_tag, contains_token):
+    filename = _resolve_period_file(base_dir, period_tag, contains_token)
+    if filename is None:
+        return None
+    return base_dir / filename
+
+
+def _resolve_period_file_multi(base_dirs, period_tag, contains_token):
+    for base_dir in base_dirs:
+        file_path = _resolve_period_file_path(base_dir, period_tag, contains_token)
+        if file_path is not None:
+            return file_path
     return None
 
 
@@ -96,13 +150,8 @@ _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
 #Cambie la ruta al PD; versión anterior:  estudio/data/
-repo_dir = _resolve_repo_dir()
 spark_session = _get_spark_session()
-if spark_session is None:
-    raise RuntimeError(
-        "Este script requiere una sesion Spark activa de Databricks."
-    )
-default_storage_root = str(repo_dir)
+default_storage_root = "/dbfs/mnt/modelos" if spark_session is not None else "/mnt/disks/modelos"
 disco = _normalize_local_path(os.getenv("GES_STORAGE_ROOT", default_storage_root)).rstrip("/")
 
 script_graficos = Path(disco) / "Proyecto_GES" / "script_graficos"
@@ -125,29 +174,45 @@ pd.set_option('display.max_columns',2000)
 # In[2]:
 
 
+snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
+
+
+# In[3]:
+
+
 # las demas rutas dependen de esto, por lo que es necesario verificar
 #assert os.getcwd() == '/estudio/data/Proyecto_GES/Prediccion'
 
 
 periodo_prediccion_param = _get_periodo_prediccion_param()
 if periodo_prediccion_param is None:
-    hoy = pd.to_datetime("today")
-    fecha_prediccion = hoy - pd.DateOffset(months=1, day=1)
-    periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+    fecha_prediccion = pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year * 100 + fecha_prediccion.month
 else:
     periodo_prediccion = periodo_prediccion_param
     fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
 
 num_a_mes = {
-    1: 'ene', 2: 'feb', 3: 'mar',  4: 'abr',  5: 'may',  6: 'jun',
-    7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'
+    1: "ene",
+    2: "feb",
+    3: "mar",
+    4: "abr",
+    5: "may",
+    6: "jun",
+    7: "jul",
+    8: "ago",
+    9: "sep",
+    10: "oct",
+    11: "nov",
+    12: "dic",
 }
-periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"  # periodo en formato abreviado usado por nombres de archivos
-renta_tope = 84.3                                               #modifcar al tope en el periodo a predecir
+periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
+renta_tope = float(os.getenv("GES_RENTA_TOPE", "84.3"))                                               #modifcar al tope en el periodo a predecir
 
 #datos del training
 train_file = 'retrain.csv'
 #carpeta de inputs
+repo_dir = _resolve_repo_dir()
 inputs = Path(_normalize_local_path(
     os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
 ))
@@ -155,7 +220,7 @@ inputs = Path(_normalize_local_path(
 #especial para el archivo original sin pre-proceso
 #aca va ltv del periodo (la tabla no predicciones) y base ges
 input2 = Path(_normalize_local_path(
-    os.getenv("GES_PREPROCESO_INPUT_DIR", str(repo_dir / "input" / "preproceso"))
+    os.getenv("GES_PREPROCESO_INPUT_DIR", f"{disco}/Proyecto_GES/Prediccion/input/preproceso")
 ))
 
 #carpeta de output
@@ -168,6 +233,8 @@ outputs = Path(_normalize_local_path(
 input_total = Path(_normalize_local_path(
     os.getenv("GES_PREDICCION_SCAN_DIR", str(inputs))
 ))
+ltv_base_dir = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", "/dbfs/mnt/modelos/ltv")))
+ltv_output_dir = Path(_normalize_local_path(os.getenv("LTV_OUTPUT_DIR", str(ltv_base_dir / "Output"))))
 
 inputs.mkdir(parents=True, exist_ok=True)
 outputs.mkdir(parents=True, exist_ok=True)
@@ -177,28 +244,32 @@ outputs.mkdir(parents=True, exist_ok=True)
 #datos del ltv
 #Automatizar la selección de este archivo.
 #ltv_file = f'02. prediccion_ltv_con_categoria_{periodo}.csv'
-ges_file = _resolve_period_file(input_total, periodo, "ready")
-ltv_file = _resolve_period_file(input_total, periodo, "prediccion_ltv")
+ges_file_path = _resolve_period_file_multi([input_total, inputs], periodo, "ready")
+ltv_file_path = _resolve_period_file_multi([input_total, inputs, ltv_output_dir], periodo, "prediccion_ltv")
 
 
 
 #ges sin prep  20.04.17_GES_mar20
 #ges_r_file = f'2021.03.19_GES_{periodo}.csv.zip'
 
-ges_r_file = _resolve_period_file(input2, periodo, "ges")
+ges_r_file_path = _resolve_period_file_path(input2, periodo, "ges")
 
-if ges_file is None:
+if ges_file_path is None:
     raise FileNotFoundError(
         f"No se encontro archivo ready_to_pred para periodo {periodo} en {input_total}"
     )
-if ltv_file is None:
+if ltv_file_path is None:
     raise FileNotFoundError(
-        f"No se encontro archivo prediccion_ltv para periodo {periodo} en {input_total}"
+        f"No se encontro archivo prediccion_ltv para periodo {periodo} en {input_total} ni en {ltv_output_dir}"
     )
+
+ges_file = ges_file_path.name
+ltv_file = ltv_file_path.name
+ges_r_file = ges_r_file_path.name if ges_r_file_path is not None else None
             
-print(f'archivo ges: {ges_file}')
-print(f'archivo ltv: {ltv_file}')
-print(f'archivo ges preproceso: {ges_r_file}')
+print(f'archivo ges: {ges_file_path}')
+print(f'archivo ltv: {ltv_file_path}')
+print(f'archivo ges preproceso: {ges_r_file_path}')
   
 
 
@@ -209,7 +280,7 @@ print(f'archivo ges preproceso: {ges_r_file}')
 
 
 #cargamos datos ges
-df_ges = pd.read_csv(inputs / ges_file, index_col=0)
+df_ges = pd.read_csv(ges_file_path, index_col=0)
 
 
 # In[5]:
@@ -282,7 +353,7 @@ target = 'fuga_5m'
 
 
 #cargamos datos ltv que se usaran posteriormente
-df_ltv = pd.read_csv(inputs / ltv_file) #.drop(columns = ['Unnamed: 0', 'index'])
+df_ltv = pd.read_csv(ltv_file_path) #.drop(columns = ['Unnamed: 0', 'index'])
 
 
 # In[11]:
@@ -299,8 +370,9 @@ df_ltv.head()
 #iniciamos h2o
 H2O_server = h2o.init(
     port=54321,
+    nthreads=-1,
     min_mem_size="2g",
-    max_mem_size="4g"
+    max_mem_size="4g",
 )
 h2o.remove_all() 
 
@@ -309,7 +381,20 @@ h2o.remove_all()
 
 
 #cargamos el modelo
-modelo_fuga = h2o.load_model(path=str(inputs / "modelos" / "may20_modelo_proyecto_ges"))
+modelo_fuga_path = Path(
+    _normalize_local_path(
+        os.getenv(
+            "GES_MODELO_FUGA_PATH",
+            str(inputs / "modelos" / "may20_modelo_proyecto_ges"),
+        )
+    )
+)
+if not modelo_fuga_path.exists():
+    raise FileNotFoundError(
+        f"No se encontro modelo de fuga en {modelo_fuga_path}. "
+        "Configura GES_MODELO_FUGA_PATH con la ruta correcta."
+    )
+modelo_fuga = h2o.load_model(path=str(modelo_fuga_path))
 
 
 # In[14]:
@@ -654,18 +739,58 @@ df_sfil_ent_to_write = df_sfil_ent.rename(columns=lambda x: x.upper())
 df_fil_clus_to_write = df_fil_clus.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
 df_ltv_to_write = df_ltv.drop(columns=['index'], errors='ignore').rename(columns=lambda x: x.upper())
 
-if spark_session is None:
-    raise RuntimeError(
-        "Este script requiere una sesion Spark activa de Databricks."
+if spark_session is not None:
+    print('Comienzo carga en tablas Databricks')
+    spark_session.createDataFrame(df_sfil_ent_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_PRED")
+    print('JC_ML_GES_PRED OK')
+    spark_session.createDataFrame(df_fil_clus_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED")
+    print('JC_ML_GES_CLUSTER_PRED OK')
+    spark_session.createDataFrame(df_ltv_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_LTV_PRED")
+    print('JC_ML_LTV_PRED OK')
+    print('Carga completa')
+else:
+    if create_engine is None or pd_writer is None:
+        raise ImportError(
+            "Dependencias de Snowflake no disponibles. Ejecuta en Databricks con Spark o instala snowflake/sqlalchemy."
+        )
+
+    snow_user = _get_credential("SNOWFLAKE_USER", "Usuario SnowFlake")
+    snow_pass = _get_credential("SNOWFLAKE_PASSWORD", "Password SnowFlake")
+    engine = create_engine(
+        'snowflake://{user}:{password}@{account}/EST/P_DDV_EST'.format(
+            user=snow_user,
+            password=snow_pass,
+            account=snow_account
+        )
     )
-print('Comienzo carga en tablas Databricks')
-spark_session.createDataFrame(df_sfil_ent_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_PRED")
-print('JC_ML_GES_PRED OK')
-spark_session.createDataFrame(df_fil_clus_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED")
-print('JC_ML_GES_CLUSTER_PRED OK')
-spark_session.createDataFrame(df_ltv_to_write).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("EST.P_DDV_EST.JC_ML_LTV_PRED")
-print('JC_ML_LTV_PRED OK')
-print('Carga completa')
+    conn = None
+    try:
+        conn = engine.connect()
+    #     results = conn.execute('select CURRENT_DATABASE(), CURRENT_SCHEMA()').fetchall()
+        
+        #Truncamos
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_LTV_PRED')
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_CLUSTER_PRED')
+        conn.execute('TRUNCATE TABLE IF EXISTS EST.P_DDV_EST.JC_ML_GES_PRED')
+        
+        print('Tablas truncadas')
+            
+        #Cargamos
+        print('Comienzo carga')
+        print('JC_ML_GES_PRED ', end ='')
+        df_sfil_ent_to_write.to_sql('JC_ML_GES_PRED', conn, index=False, if_exists='append', method=pd_writer) # , chunksize=12000,
+        print('Ok')
+        print('JC_ML_GES_CLUSTER_PRED ', end='')
+        df_fil_clus_to_write.to_sql('JC_ML_GES_CLUSTER_PRED', conn, index=False, if_exists='append', method=pd_writer)
+        print('OK')
+        print('JC_ML_LTV_PRED ', end='')
+        df_ltv_to_write.to_sql('JC_ML_LTV_PRED', conn, index=False, if_exists='append', method=pd_writer)
+        print('OK')
+        print('Carga completa')
+    finally:
+        if conn is not None:
+            conn.close()
+        engine.dispose()
 
 
 # In[47]:
