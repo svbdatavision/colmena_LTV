@@ -28,6 +28,7 @@
 import time
 import os
 import sys
+import shutil
 from pathlib import Path
 from numba import njit, prange
 import pandas as pd
@@ -72,6 +73,17 @@ def _normalize_local_path(path_value):
     return path_value
 
 
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
 def _get_spark_session():
     try:
         return spark  # type: ignore[name-defined]
@@ -111,6 +123,23 @@ def _get_credential(env_name, prompt_label):
     )
 
 
+def _get_periodo_prediccion_param():
+    raw_value = ""
+    try:
+        dbutils.widgets.text("periodo_prediccion", "")  # type: ignore[name-defined]
+        raw_value = dbutils.widgets.get("periodo_prediccion").strip()  # type: ignore[name-defined]
+    except Exception:
+        raw_value = os.getenv("PERIODO_PREDICCION", "").strip()
+
+    if not raw_value:
+        return None
+    if not (raw_value.isdigit() and len(raw_value) == 6):
+        raise ValueError(
+            "periodo_prediccion debe tener formato YYYYMM (ejemplo: 202501)."
+        )
+    return int(raw_value)
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -142,8 +171,13 @@ for required_dir in [
 ###########################################################
 #descomentar si se quiere definir el periodo manualmente
 #periodo_de_prediccion = '202201' #añomes. p.ej'201905'
-fecha_prediccion =  pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
-periodo_prediccion = fecha_prediccion.year*100 + fecha_prediccion.month
+periodo_prediccion_param = _get_periodo_prediccion_param()
+if periodo_prediccion_param is None:
+    fecha_prediccion = pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year * 100 + fecha_prediccion.month
+else:
+    periodo_prediccion = periodo_prediccion_param
+    fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
 
 
 #La base debe tener el periodo que se va a predecir en su nombre ej. -> marzo: 20.04.16 LTV_202003.csv
@@ -293,7 +327,7 @@ print("Ok")
 # In[ ]:
 
 
-h2o.init(port=54321, min_mem_size = 15, max_mem_size = 25)
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 h2o.remove_all()
 
 
@@ -905,7 +939,7 @@ ltv_table_name = f"LTV.PREDICCION_MODULOS_LTV_{nombre_fancy}"
 #Liberamos memoria de los procesos de h2o
 h2o.remove_all()
 h2o.shutdown()
-h2o.init(port=54321, min_mem_size='20g')
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 
 
 # In[ ]:
@@ -1108,7 +1142,7 @@ time.sleep(25)
 
 
 # De nuevo para asegurarse de que la memoria esté disponible
-h2o.init(port=54321, min_mem_size='20g')
+h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 h2o.remove_all()
 
 model = h2o.load_model(path=f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5')
@@ -1144,6 +1178,17 @@ nombre_fancy
 csv_name = f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv'
 #df_ltv.to_pickle(f'/home/ubuntu/spike/LTV3/Output/prediccion_ltv_con_categoria_{fancy_name}.pkl')
 df_ltv.to_csv(csv_name, index = False)
+repo_dir = _resolve_repo_dir()
+ges_pred_input_dir = Path(_normalize_local_path(
+    os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
+))
+ges_pred_input_dir.mkdir(parents=True, exist_ok=True)
+target_prediccion_ltv = ges_pred_input_dir / Path(csv_name).name
+if Path(csv_name).resolve() != target_prediccion_ltv.resolve():
+    shutil.copy2(csv_name, target_prediccion_ltv)
+    print(f"Archivo prediccion_ltv copiado a {target_prediccion_ltv}")
+else:
+    print(f"Archivo prediccion_ltv ya esta en {target_prediccion_ltv}")
 
 ltv_table_name = f"LTV.PREDICCION_LTV_CATLTV_{nombre_fancy}"
 #!bq --location=US load --autodetect --replace --source_format=CSV {ltv_table_name} "{csv_name}"

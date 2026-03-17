@@ -103,6 +103,49 @@ def _resolve_period_file(base_dir, period_tag, contains_token):
     return None
 
 
+def _resolve_repo_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        try:
+            nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()  # type: ignore[name-defined]
+            return Path(f"/Workspace{nb_path}").resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
+def _get_periodo_prediccion_param():
+    raw_value = ""
+    try:
+        dbutils.widgets.text("periodo_prediccion", "")  # type: ignore[name-defined]
+        raw_value = dbutils.widgets.get("periodo_prediccion").strip()  # type: ignore[name-defined]
+    except Exception:
+        raw_value = os.getenv("PERIODO_PREDICCION", "").strip()
+
+    if not raw_value:
+        return None
+    if not (raw_value.isdigit() and len(raw_value) == 6):
+        raise ValueError(
+            "periodo_prediccion debe tener formato YYYYMM (ejemplo: 202501)."
+        )
+    return int(raw_value)
+
+
+def _resolve_period_file_path(base_dir, period_tag, contains_token):
+    filename = _resolve_period_file(base_dir, period_tag, contains_token)
+    if filename is None:
+        return None
+    return base_dir / filename
+
+
+def _resolve_period_file_multi(base_dirs, period_tag, contains_token):
+    for base_dir in base_dirs:
+        file_path = _resolve_period_file_path(base_dir, period_tag, contains_token)
+        if file_path is not None:
+            return file_path
+    return None
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -141,13 +184,35 @@ snow_account = os.getenv("SNOWFLAKE_ACCOUNT", "isapre_colmena.us-east-1")
 #assert os.getcwd() == '/estudio/data/Proyecto_GES/Prediccion'
 
 
-periodo = 'jun24'                                               #Modificar cada mes el periodo en español, en proceso 1 estan las abreviaciones
-renta_tope = 84.3                                               #modifcar al tope en el periodo a predecir
+periodo_prediccion_param = _get_periodo_prediccion_param()
+if periodo_prediccion_param is None:
+    fecha_prediccion = pd.to_datetime("today") - pd.DateOffset(months=1, day=1)
+    periodo_prediccion = fecha_prediccion.year * 100 + fecha_prediccion.month
+else:
+    periodo_prediccion = periodo_prediccion_param
+    fecha_prediccion = pd.to_datetime(str(periodo_prediccion), format="%Y%m")
+
+num_a_mes = {
+    1: "ene",
+    2: "feb",
+    3: "mar",
+    4: "abr",
+    5: "may",
+    6: "jun",
+    7: "jul",
+    8: "ago",
+    9: "sep",
+    10: "oct",
+    11: "nov",
+    12: "dic",
+}
+periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
+renta_tope = float(os.getenv("GES_RENTA_TOPE", "84.3"))                                               #modifcar al tope en el periodo a predecir
 
 #datos del training
 train_file = 'retrain.csv'
 #carpeta de inputs
-repo_dir = Path(__file__).resolve().parent
+repo_dir = _resolve_repo_dir()
 inputs = Path(_normalize_local_path(
     os.getenv("GES_PREDICCION_INPUT_DIR", str(repo_dir / "input" / "prediccion"))
 ))
@@ -168,6 +233,8 @@ outputs = Path(_normalize_local_path(
 input_total = Path(_normalize_local_path(
     os.getenv("GES_PREDICCION_SCAN_DIR", str(inputs))
 ))
+ltv_base_dir = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", "/dbfs/mnt/modelos/ltv")))
+ltv_output_dir = Path(_normalize_local_path(os.getenv("LTV_OUTPUT_DIR", str(ltv_base_dir / "Output"))))
 
 inputs.mkdir(parents=True, exist_ok=True)
 outputs.mkdir(parents=True, exist_ok=True)
@@ -177,28 +244,32 @@ outputs.mkdir(parents=True, exist_ok=True)
 #datos del ltv
 #Automatizar la selección de este archivo.
 #ltv_file = f'02. prediccion_ltv_con_categoria_{periodo}.csv'
-ges_file = _resolve_period_file(input_total, periodo, "ready")
-ltv_file = _resolve_period_file(input_total, periodo, "prediccion_ltv")
+ges_file_path = _resolve_period_file_multi([input_total, inputs], periodo, "ready")
+ltv_file_path = _resolve_period_file_multi([input_total, inputs, ltv_output_dir], periodo, "prediccion_ltv")
 
 
 
 #ges sin prep  20.04.17_GES_mar20
 #ges_r_file = f'2021.03.19_GES_{periodo}.csv.zip'
 
-ges_r_file = _resolve_period_file(input2, periodo, "ges")
+ges_r_file_path = _resolve_period_file_path(input2, periodo, "ges")
 
-if ges_file is None:
+if ges_file_path is None:
     raise FileNotFoundError(
         f"No se encontro archivo ready_to_pred para periodo {periodo} en {input_total}"
     )
-if ltv_file is None:
+if ltv_file_path is None:
     raise FileNotFoundError(
-        f"No se encontro archivo prediccion_ltv para periodo {periodo} en {input_total}"
+        f"No se encontro archivo prediccion_ltv para periodo {periodo} en {input_total} ni en {ltv_output_dir}"
     )
+
+ges_file = ges_file_path.name
+ltv_file = ltv_file_path.name
+ges_r_file = ges_r_file_path.name if ges_r_file_path is not None else None
             
-print(f'archivo ges: {ges_file}')
-print(f'archivo ltv: {ltv_file}')
-print(f'archivo ges preproceso: {ges_r_file}')
+print(f'archivo ges: {ges_file_path}')
+print(f'archivo ltv: {ltv_file_path}')
+print(f'archivo ges preproceso: {ges_r_file_path}')
   
 
 
@@ -209,7 +280,7 @@ print(f'archivo ges preproceso: {ges_r_file}')
 
 
 #cargamos datos ges
-df_ges = pd.read_csv(inputs / ges_file, index_col=0)
+df_ges = pd.read_csv(ges_file_path, index_col=0)
 
 
 # In[5]:
@@ -282,7 +353,7 @@ target = 'fuga_5m'
 
 
 #cargamos datos ltv que se usaran posteriormente
-df_ltv = pd.read_csv(inputs / ltv_file) #.drop(columns = ['Unnamed: 0', 'index'])
+df_ltv = pd.read_csv(ltv_file_path) #.drop(columns = ['Unnamed: 0', 'index'])
 
 
 # In[11]:
@@ -297,7 +368,12 @@ df_ltv.head()
 
 
 #iniciamos h2o
-H2O_server = h2o.init(port=54321, nthreads=-1, max_mem_size =60) #max_mem_size considera GB si no se espefica
+H2O_server = h2o.init(
+    port=54321,
+    nthreads=-1,
+    min_mem_size="2g",
+    max_mem_size="4g",
+)
 h2o.remove_all() 
 
 
@@ -305,7 +381,20 @@ h2o.remove_all()
 
 
 #cargamos el modelo
-modelo_fuga = h2o.load_model(path=str(inputs / "modelos" / "may20_modelo_proyecto_ges"))
+modelo_fuga_path = Path(
+    _normalize_local_path(
+        os.getenv(
+            "GES_MODELO_FUGA_PATH",
+            str(inputs / "modelos" / "may20_modelo_proyecto_ges"),
+        )
+    )
+)
+if not modelo_fuga_path.exists():
+    raise FileNotFoundError(
+        f"No se encontro modelo de fuga en {modelo_fuga_path}. "
+        "Configura GES_MODELO_FUGA_PATH con la ruta correcta."
+    )
+modelo_fuga = h2o.load_model(path=str(modelo_fuga_path))
 
 
 # In[14]:
