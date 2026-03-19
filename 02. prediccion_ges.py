@@ -146,6 +146,74 @@ def _resolve_period_file_multi(base_dirs, period_tag, contains_token):
     return None
 
 
+def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label="modelo"):
+    model_format = (model_format or "auto").strip().lower()
+    if model_format not in {"auto", "binary", "mojo"}:
+        raise ValueError(
+            f"model_format invalido ({model_format}) para {model_label}. "
+            "Usar: auto, binary o mojo."
+        )
+
+    base_path = Path(_normalize_local_path(str(model_base_path)))
+    mojo_candidates = []
+    binary_candidates = []
+
+    if base_path.suffix.lower() in {".zip", ".mojo"}:
+        mojo_candidates = [base_path]
+    elif base_path.suffix:
+        binary_candidates = [base_path]
+    else:
+        binary_candidates = [base_path]
+        mojo_candidates = [
+            Path(str(base_path) + ".zip"),
+            Path(str(base_path) + ".mojo"),
+            base_path / "mojo.zip",
+            base_path / "model.zip",
+        ]
+
+    # Dedup conservando orden
+    seen = set()
+    mojo_candidates = [p for p in mojo_candidates if not (str(p) in seen or seen.add(str(p)))]
+    seen = set()
+    binary_candidates = [p for p in binary_candidates if not (str(p) in seen or seen.add(str(p)))]
+
+    attempts = []
+    if model_format in {"auto", "mojo"}:
+        attempts.extend([("mojo", p) for p in mojo_candidates if p.exists()])
+    if model_format in {"auto", "binary"}:
+        attempts.extend([("binary", p) for p in binary_candidates if p.exists()])
+
+    if not attempts:
+        expected = [str(p) for p in (mojo_candidates + binary_candidates)]
+        raise FileNotFoundError(
+            f"No se encontro artefacto para {model_label}. "
+            f"Paths evaluados: {expected}"
+        )
+
+    last_error = None
+    for artifact_type, artifact_path in attempts:
+        try:
+            if artifact_type == "mojo":
+                print(f"Cargando {model_label} como MOJO: {artifact_path}")
+                return h2o.import_mojo(path=str(artifact_path))
+            print(f"Cargando {model_label} como binario H2O: {artifact_path}")
+            return h2o.load_model(path=str(artifact_path))
+        except Exception as exc:
+            last_error = exc
+            err_text = str(exc)
+            if "Found version" in err_text and "running version" in err_text:
+                raise RuntimeError(
+                    f"No se pudo cargar {model_label} por incompatibilidad de version H2O. "
+                    f"Detalle: {err_text}. "
+                    "Recomendacion: convertir este modelo a MOJO en un entorno legacy "
+                    "(H2O 3.20.x + Java 8) y volver a ejecutar con GES_H2O_MODEL_FORMAT=mojo."
+                ) from exc
+
+    raise RuntimeError(
+        f"No se pudo cargar {model_label}. Ultimo error: {last_error}"
+    ) from last_error
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -394,7 +462,12 @@ if not modelo_fuga_path.exists():
         f"No se encontro modelo de fuga en {modelo_fuga_path}. "
         "Configura GES_MODELO_FUGA_PATH con la ruta correcta."
     )
-modelo_fuga = h2o.load_model(path=str(modelo_fuga_path))
+ges_h2o_model_format = os.getenv("GES_H2O_MODEL_FORMAT", "auto")
+modelo_fuga = _load_h2o_model_compatible(
+    modelo_fuga_path,
+    model_format=ges_h2o_model_format,
+    model_label="modelo_fuga_ges",
+)
 
 
 # In[14]:
