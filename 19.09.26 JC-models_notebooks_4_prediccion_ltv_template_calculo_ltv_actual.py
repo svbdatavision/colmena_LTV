@@ -140,6 +140,74 @@ def _get_periodo_prediccion_param():
     return int(raw_value)
 
 
+def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label="modelo"):
+    model_format = (model_format or "auto").strip().lower()
+    if model_format not in {"auto", "binary", "mojo"}:
+        raise ValueError(
+            f"model_format invalido ({model_format}) para {model_label}. "
+            "Usar: auto, binary o mojo."
+        )
+
+    base_path = Path(_normalize_local_path(str(model_base_path)))
+    mojo_candidates = []
+    binary_candidates = []
+
+    if base_path.suffix.lower() in {".zip", ".mojo"}:
+        mojo_candidates = [base_path]
+    elif base_path.suffix:
+        binary_candidates = [base_path]
+    else:
+        binary_candidates = [base_path]
+        mojo_candidates = [
+            Path(str(base_path) + ".zip"),
+            Path(str(base_path) + ".mojo"),
+            base_path / "mojo.zip",
+            base_path / "model.zip",
+        ]
+
+    # Dedup conservando orden
+    seen = set()
+    mojo_candidates = [p for p in mojo_candidates if not (str(p) in seen or seen.add(str(p)))]
+    seen = set()
+    binary_candidates = [p for p in binary_candidates if not (str(p) in seen or seen.add(str(p)))]
+
+    attempts = []
+    if model_format in {"auto", "mojo"}:
+        attempts.extend([("mojo", p) for p in mojo_candidates if p.exists()])
+    if model_format in {"auto", "binary"}:
+        attempts.extend([("binary", p) for p in binary_candidates if p.exists()])
+
+    if not attempts:
+        expected = [str(p) for p in (mojo_candidates + binary_candidates)]
+        raise FileNotFoundError(
+            f"No se encontro artefacto para {model_label}. "
+            f"Paths evaluados: {expected}"
+        )
+
+    last_error = None
+    for artifact_type, artifact_path in attempts:
+        try:
+            if artifact_type == "mojo":
+                print(f"Cargando {model_label} como MOJO: {artifact_path}")
+                return h2o.import_mojo(path=str(artifact_path))
+            print(f"Cargando {model_label} como binario H2O: {artifact_path}")
+            return h2o.load_model(path=str(artifact_path))
+        except Exception as exc:
+            last_error = exc
+            err_text = str(exc)
+            if "Found version" in err_text and "running version" in err_text:
+                raise RuntimeError(
+                    f"No se pudo cargar {model_label} por incompatibilidad de version H2O. "
+                    f"Detalle: {err_text}. "
+                    "Recomendacion: convertir este modelo a MOJO en un entorno legacy "
+                    "(H2O 3.20.x + Java 8) y volver a ejecutar con LTV_H2O_MODEL_FORMAT=mojo."
+                ) from exc
+
+    raise RuntimeError(
+        f"No se pudo cargar {model_label}. Ultimo error: {last_error}"
+    ) from last_error
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -157,6 +225,7 @@ pid = "estudios-242917"
 spark_session = _get_spark_session()
 default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
 carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
+ltv_h2o_model_format = os.getenv("LTV_H2O_MODEL_FORMAT", "auto")
 carpeta_ltv = f"{carpeta_ltv_path.as_posix()}/"
 datos_ltv_folder = f"{(carpeta_ltv_path / 'Input').as_posix()}/"
 #asume que existen las carpetas "Greats_expectations_LTV", "models", "Output"
@@ -667,11 +736,23 @@ for folder in folders:
     for key in keys:
         print(folder + ' - ' + key)
         if folder == 'ingresos':
-            modelos_ingresos[key] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/'+key+'/retrain_ltv_ingresos_' + key)
+            modelos_ingresos[key] = _load_h2o_model_compatible(
+                f'{carpeta_models_automl}ingresos_avg/'+key+'/retrain_ltv_ingresos_' + key,
+                model_format=ltv_h2o_model_format,
+                model_label=f"ingresos_{key}",
+            )
         elif folder == 'costos':
-            modelos_costos[key] = h2o.load_model(f'{carpeta_models_automl}costos_avg/' +key+'/retrain_ltv_costos_' + key)
+            modelos_costos[key] = _load_h2o_model_compatible(
+                f'{carpeta_models_automl}costos_avg/' +key+'/retrain_ltv_costos_' + key,
+                model_format=ltv_h2o_model_format,
+                model_label=f"costos_{key}",
+            )
         else:
-            modelos_fuga[key] = h2o.load_model(f'{carpeta_models_automl}fuga/' +key[1]+key[0]+'/retrain_ltv_fuga_' + key[1]+key[0])
+            modelos_fuga[key] = _load_h2o_model_compatible(
+                f'{carpeta_models_automl}fuga/' +key[1]+key[0]+'/retrain_ltv_fuga_' + key[1]+key[0],
+                model_format=ltv_h2o_model_format,
+                model_label=f"fuga_{key}",
+            )
 
 # modelos_ingresos['1y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/1y/StackedEnsemble_AllModels_0_AutoML_20190103_170253')
 # modelos_ingresos['2y'] = h2o.load_model(f'{carpeta_models_automl}ingresos_avg/2y/StackedEnsemble_AllModels_0_AutoML_20190103_190356')
@@ -1145,7 +1226,11 @@ time.sleep(25)
 h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
 h2o.remove_all()
 
-model = h2o.load_model(path=f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5')
+model = _load_h2o_model_compatible(
+    f'{carpeta_ltv}Output/modelos_categorias_clustering_predicting_average/kmeans_5',
+    model_format=ltv_h2o_model_format,
+    model_label="kmeans_5",
+)
 df_ltv.reset_index(inplace = True)
 
 
