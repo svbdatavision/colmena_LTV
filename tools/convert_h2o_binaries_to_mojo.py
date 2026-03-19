@@ -16,6 +16,7 @@ Archivo model_paths.txt:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import traceback
@@ -62,9 +63,15 @@ def _convert_model(model_path, output_dir, genmodel_jar):
         raise FileNotFoundError(f"Modelo inexistente: {model_path}")
 
     model = h2o.load_model(str(model_path))
-    out_path = model.download_mojo(path=str(output_dir), get_genmodel_jar=genmodel_jar)
-    print(f"[OK] MOJO exportado: {out_path}")
-    return out_path
+    downloaded = Path(model.download_mojo(path=str(output_dir), get_genmodel_jar=genmodel_jar))
+    canonical = Path(str(model_path) + ".zip")
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    if canonical.exists():
+        canonical.unlink()
+    shutil.copy2(downloaded, canonical)
+    print(f"[OK] MOJO exportado: {downloaded}")
+    print(f"[OK] MOJO canonical: {canonical}")
+    return canonical
 
 
 def main():
@@ -78,8 +85,9 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Directorio de salida para ZIP MOJO.",
+        required=False,
+        default="/tmp/h2o_mojo_export",
+        help="Directorio temporal de descarga para ZIP MOJO (default: /tmp/h2o_mojo_export).",
     )
     parser.add_argument(
         "--genmodel-jar",
