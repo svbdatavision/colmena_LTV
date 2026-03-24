@@ -208,6 +208,32 @@ def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label
     ) from last_error
 
 
+def _load_first_available_model(model_candidates, model_format="auto", model_label="modelo"):
+    if not model_candidates:
+        raise ValueError(f"Sin candidatos para {model_label}")
+
+    missing = []
+    last_error = None
+    for candidate in model_candidates:
+        try:
+            return _load_h2o_model_compatible(
+                candidate,
+                model_format=model_format,
+                model_label=model_label,
+            )
+        except FileNotFoundError:
+            missing.append(str(candidate))
+        except Exception as exc:
+            last_error = exc
+            break
+
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError(
+        f"No se encontro modelo para {model_label}. Paths evaluados: {missing}"
+    )
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -223,7 +249,11 @@ pd.set_option('display.max_columns',2000)
 ###########################################################
 pid = "estudios-242917"
 spark_session = _get_spark_session()
-default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
+default_ltv_base_candidate = Path("/Volumes/bigdata/default/ml_models/modelo_ltv/ltv")
+if default_ltv_base_candidate.exists():
+    default_ltv_base = str(default_ltv_base_candidate)
+else:
+    default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
 carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
 ltv_h2o_model_format = os.getenv("LTV_H2O_MODEL_FORMAT", "auto")
 carpeta_ltv = f"{carpeta_ltv_path.as_posix()}/"
@@ -732,24 +762,50 @@ folders = {'fuga', 'costos', 'ingresos'}
 carpeta_models_automl = f"{carpeta_ltv}models/h2o_models/modelsautoml/"
 print(carpeta_models_automl)
 
+legacy_stack_map = {
+    ("ingresos", "1y"): "StackedEnsemble_AllModels_0_AutoML_20190103_170253",
+    ("ingresos", "2y"): "StackedEnsemble_AllModels_0_AutoML_20190103_190356",
+    ("ingresos", "3y"): "StackedEnsemble_AllModels_0_AutoML_20190103_210454",
+    ("costos", "1y"): "StackedEnsemble_AllModels_0_AutoML_20190103_170925",
+    ("costos", "2y"): "StackedEnsemble_AllModels_0_AutoML_20190103_191041",
+    ("costos", "3y"): "StackedEnsemble_AllModels_0_AutoML_20190103_211140",
+    ("fuga", "1y"): "StackedEnsemble_AllModels_0_AutoML_20181211_175510",
+    ("fuga", "2y"): "StackedEnsemble_AllModels_0_AutoML_20181211_195722",
+    ("fuga", "3y"): "StackedEnsemble_AllModels_0_AutoML_20181211_215935",
+}
+
 for folder in folders:
     for key in keys:
         print(folder + ' - ' + key)
         if folder == 'ingresos':
-            modelos_ingresos[key] = _load_h2o_model_compatible(
+            model_candidates = [
                 f'{carpeta_models_automl}ingresos_avg/'+key+'/retrain_ltv_ingresos_' + key,
+                f'{carpeta_models_automl}ingresos_avg/'+key+'/' + legacy_stack_map[(folder, key)],
+            ]
+            modelos_ingresos[key] = _load_first_available_model(
+                model_candidates,
                 model_format=ltv_h2o_model_format,
                 model_label=f"ingresos_{key}",
             )
         elif folder == 'costos':
-            modelos_costos[key] = _load_h2o_model_compatible(
+            model_candidates = [
                 f'{carpeta_models_automl}costos_avg/' +key+'/retrain_ltv_costos_' + key,
+                f'{carpeta_models_automl}costos_avg/' +key+'/' + legacy_stack_map[(folder, key)],
+            ]
+            modelos_costos[key] = _load_first_available_model(
+                model_candidates,
                 model_format=ltv_h2o_model_format,
                 model_label=f"costos_{key}",
             )
         else:
-            modelos_fuga[key] = _load_h2o_model_compatible(
+            model_candidates = [
                 f'{carpeta_models_automl}fuga/' +key[1]+key[0]+'/retrain_ltv_fuga_' + key[1]+key[0],
+                f'{carpeta_models_automl}fuga/' +key+'/retrain_ltv_fuga_' + key,
+                f'{carpeta_models_automl}fuga/' +key[1]+key[0]+'/' + legacy_stack_map[(folder, key)],
+                f'{carpeta_models_automl}fuga/' +key+'/' + legacy_stack_map[(folder, key)],
+            ]
+            modelos_fuga[key] = _load_first_available_model(
+                model_candidates,
                 model_format=ltv_h2o_model_format,
                 model_label=f"fuga_{key}",
             )
