@@ -52,7 +52,7 @@ import getpass as gp
 
 # import feather
 try:
-    from IPython.core.display import display, HTML
+    from IPython.display import display, HTML
 except Exception:
     display = None
     HTML = None
