@@ -195,7 +195,12 @@ def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label
         try:
             if artifact_type == "mojo":
                 print(f"Cargando {model_label} como MOJO: {artifact_path}")
-                return h2o.import_mojo(path=str(artifact_path))
+                # Compatibilidad entre versiones de H2O:
+                # algunas usan h2o.import_mojo(mojo_path), otras aceptan keyword path.
+                try:
+                    return h2o.import_mojo(str(artifact_path))
+                except TypeError:
+                    return h2o.import_mojo(path=str(artifact_path))
             print(f"Cargando {model_label} como binario H2O: {artifact_path}")
             return h2o.load_model(path=str(artifact_path))
         except Exception as exc:
