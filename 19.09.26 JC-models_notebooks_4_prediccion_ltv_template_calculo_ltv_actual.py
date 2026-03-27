@@ -33,7 +33,10 @@ from pathlib import Path
 from numba import njit, prange
 import pandas as pd
 import json
-import great_expectations as ge
+try:
+    import great_expectations as ge
+except Exception:
+    ge = None
 import numpy as np
 import h2o
 import re
@@ -206,6 +209,14 @@ def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label
     raise RuntimeError(
         f"No se pudo cargar {model_label}. Ultimo error: {last_error}"
     ) from last_error
+
+
+def _load_json_if_exists(json_path):
+    p = Path(json_path)
+    if not p.exists():
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _load_first_available_model(model_candidates, model_format="auto", model_label="modelo"):
@@ -701,27 +712,33 @@ df.drop(labels=['sexo'], axis=1, inplace=True)
 
 # Acá se hace check de Great Expectations intermedio
 df.to_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv')
+expectations_inputs_path = f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json'
+my_expectations_config = _load_json_if_exists(expectations_inputs_path)
+if ge is not None and my_expectations_config is not None:
+    #El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script
+    my_df = ge.read_csv(
+        f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv',
+        expectations_config=my_expectations_config,
+    )
 
-with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo.json') as f:
-    my_expectations_config = json.load(f)
+    # Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
+    my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
+    my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
+    my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
+    my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
+    my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
 
-#El nombre fancy corresponde al mes de ltv predicho que se quiere validar, entregado al principio del script    
+    resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
 
-my_df = ge.read_csv(f'{carpeta_ltv}Greats_expectations_LTV/ltv_{nombre_fancy}_inputs.csv', expectations_config=my_expectations_config)
-
-# Por ahora se eliminan acá los valores negativos en estas variables, que no deberían estar
-my_df.loc[my_df['gasto_Licencias_excl'] < 0., 'gasto_Licencias_excl'] = 0 # Tiene un valor con (-)
-my_df.loc[my_df['costo_total'] < 0., 'costo_total'] = 0 # Tiene 213 valores con (-)
-my_df.loc[my_df['factor_riesgo'] < 0., 'factor_riesgo'] = 0 # Tiene 158 valores con (-)
-my_df.loc[my_df['gasto_Licencias_mva_13to24m'] < 0., 'gasto_Licencias_mva_13to24m'] = 0 # Tiene dos valores con (-)
-my_df.loc[my_df['gasto_Licencias_Excl_mva_7to12m'] < 0., 'gasto_Licencias_Excl_mva_7to12m'] = 0 # Tiene un valor con (-)
-
-resultado = my_df.validate(result_format='BASIC', only_return_failures=True)
-
-with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
-    json.dump(resultado, outfile)
-    
-print("Guardado!")
+    with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_inputs.json', 'w') as outfile:
+        json.dump(resultado, outfile)
+    print("Guardado!")
+else:
+    print(
+        f"Great Expectations intermedio omitido. "
+        f"ge_disponible={ge is not None}, config_encontrada={my_expectations_config is not None}, "
+        f"path={expectations_inputs_path}"
+    )
 
 #assert resultado['success']
 
@@ -1353,18 +1370,27 @@ tiempo_transcurrido = (end - start)/60
 
 
 ## Acá se hace check de Great Expectations final (output)
+expectations_outputs_path = f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json'
+my_expectations_config = _load_json_if_exists(expectations_outputs_path)
+if ge is not None and my_expectations_config is not None:
+    my_df = ge.read_csv(
+        f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv',
+        expectations_config=my_expectations_config,
+    )
+    resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
 
-with open(f'{carpeta_ltv}Greats_expectations_LTV/ltv_expectations_marzo_output.json') as f:
-    my_expectations_config = json.load(f)
-
-my_df = ge.read_csv(f'{carpeta_ltv}Output/prediccion_ltv_{nombre_fancy}.csv', expectations_config=my_expectations_config)
-                    
-resultado_output = my_df.validate(result_format='BASIC', only_return_failures=True)
-
-with open(f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
-          'w') as outfile:
-    json.dump(resultado_output, outfile)
-
+    with open(
+        f'{carpeta_ltv}Greats_expectations_LTV/resultado_GE_{nombre_fancy}_outputs.json',
+        'w'
+    ) as outfile:
+        json.dump(resultado_output, outfile)
+    print("Guardado!")
+else:
+    print(
+        f"Great Expectations final omitido. "
+        f"ge_disponible={ge is not None}, config_encontrada={my_expectations_config is not None}, "
+        f"path={expectations_outputs_path}"
+    )
 print("Guardado!")
 
 #assert resultado_output['success']
