@@ -198,6 +198,12 @@ def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label
         except Exception as exc:
             last_error = exc
             err_text = str(exc)
+            if "OutOfMemoryError" in err_text or "Java heap space" in err_text:
+                raise RuntimeError(
+                    f"No se pudo cargar {model_label} por memoria insuficiente de H2O (Java heap). "
+                    f"Detalle: {err_text}. "
+                    "Aumentar LTV_H2O_MAX_MEM (por ejemplo 10g/12g) y asegurar memoria suficiente en driver."
+                ) from exc
             if "Found version" in err_text and "running version" in err_text:
                 raise RuntimeError(
                     f"No se pudo cargar {model_label} por incompatibilidad de version H2O. "
@@ -245,6 +251,13 @@ def _load_first_available_model(model_candidates, model_format="auto", model_lab
     )
 
 
+def _init_h2o_safe(port=54321, min_mem="4g", max_mem="8g", nthreads=-1):
+    print(
+        f"Iniciando H2O (port={port}, min_mem_size={min_mem}, max_mem_size={max_mem}, nthreads={nthreads})"
+    )
+    return h2o.init(port=port, min_mem_size=min_mem, max_mem_size=max_mem, nthreads=nthreads)
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -267,6 +280,9 @@ else:
     default_ltv_base = "/dbfs/mnt/modelos/ltv" if spark_session is not None else "/estudio/data/ltv"
 carpeta_ltv_path = Path(_normalize_local_path(os.getenv("LTV_BASE_DIR", default_ltv_base)))
 ltv_h2o_model_format = os.getenv("LTV_H2O_MODEL_FORMAT", "auto")
+h2o_min_mem = os.getenv("LTV_H2O_MIN_MEM", "4g")
+h2o_max_mem = os.getenv("LTV_H2O_MAX_MEM", "8g")
+h2o_nthreads = int(os.getenv("LTV_H2O_NTHREADS", "-1"))
 carpeta_ltv = f"{carpeta_ltv_path.as_posix()}/"
 datos_ltv_folder = f"{(carpeta_ltv_path / 'Input').as_posix()}/"
 #asume que existen las carpetas "Greats_expectations_LTV", "models", "Output"
@@ -437,7 +453,7 @@ print("Ok")
 # In[ ]:
 
 
-h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
+_init_h2o_safe(min_mem=h2o_min_mem, max_mem=h2o_max_mem, nthreads=h2o_nthreads)
 h2o.remove_all()
 
 
@@ -1093,7 +1109,7 @@ ltv_table_name = f"LTV.PREDICCION_MODULOS_LTV_{nombre_fancy}"
 #Liberamos memoria de los procesos de h2o
 h2o.remove_all()
 h2o.shutdown()
-h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
+_init_h2o_safe(min_mem=h2o_min_mem, max_mem=h2o_max_mem, nthreads=h2o_nthreads)
 
 
 # In[ ]:
@@ -1296,7 +1312,7 @@ time.sleep(25)
 
 
 # De nuevo para asegurarse de que la memoria esté disponible
-h2o.init(port=54321, min_mem_size="2g", max_mem_size="4g")
+_init_h2o_safe(min_mem=h2o_min_mem, max_mem=h2o_max_mem, nthreads=h2o_nthreads)
 h2o.remove_all()
 
 model = _load_h2o_model_compatible(

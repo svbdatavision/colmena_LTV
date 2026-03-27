@@ -206,6 +206,12 @@ def _load_h2o_model_compatible(model_base_path, model_format="auto", model_label
         except Exception as exc:
             last_error = exc
             err_text = str(exc)
+            if "OutOfMemoryError" in err_text or "Java heap space" in err_text:
+                raise RuntimeError(
+                    f"No se pudo cargar {model_label} por memoria insuficiente de H2O (Java heap). "
+                    f"Detalle: {err_text}. "
+                    "Aumentar GES_H2O_MAX_MEM (por ejemplo 10g/12g) y asegurar memoria suficiente en driver."
+                ) from exc
             if "Found version" in err_text and "running version" in err_text:
                 raise RuntimeError(
                     f"No se pudo cargar {model_label} por incompatibilidad de version H2O. "
@@ -281,6 +287,9 @@ num_a_mes = {
 }
 periodo = f"{num_a_mes[fecha_prediccion.month]}{fecha_prediccion:%y}"
 renta_tope = float(os.getenv("GES_RENTA_TOPE", "84.3"))                                               #modifcar al tope en el periodo a predecir
+h2o_min_mem = os.getenv("GES_H2O_MIN_MEM", "4g")
+h2o_max_mem = os.getenv("GES_H2O_MAX_MEM", "8g")
+h2o_nthreads = int(os.getenv("GES_H2O_NTHREADS", "-1"))
 
 #datos del training
 train_file = 'retrain.csv'
@@ -443,9 +452,9 @@ df_ltv.head()
 #iniciamos h2o
 H2O_server = h2o.init(
     port=54321,
-    nthreads=-1,
-    min_mem_size="2g",
-    max_mem_size="4g",
+    nthreads=h2o_nthreads,
+    min_mem_size=h2o_min_mem,
+    max_mem_size=h2o_max_mem,
 )
 h2o.remove_all() 
 
