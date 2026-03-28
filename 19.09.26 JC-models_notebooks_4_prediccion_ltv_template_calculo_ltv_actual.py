@@ -259,6 +259,23 @@ def _init_h2o_safe(port=54321, min_mem="4g", max_mem="8g", nthreads=-1):
     return h2o.init(port=port, min_mem_size=min_mem, max_mem_size=max_mem, nthreads=nthreads)
 
 
+def _fit_transform_quantiles_safe(df, source_col, target_col, n_quantiles=100):
+    valid = df[source_col].dropna()
+    if valid.empty:
+        # Si no hay datos validos, mantenemos NaN para evitar abortar el proceso.
+        df[target_col] = np.nan
+        print(f"Warning: columna {source_col} sin datos validos; {target_col} queda NaN.")
+        return None
+
+    n_quant = min(n_quantiles, len(valid))
+    transformer = QuantileTransformer(n_quantiles=n_quant)
+    df[target_col] = np.nan
+    df.loc[~df[source_col].isna(), target_col] = transformer.fit_transform(
+        valid.values.reshape(-1, 1)
+    ).ravel()
+    return transformer
+
+
 _run_ipython_magic('load_ext', 'autoreload')
 _run_ipython_magic('autoreload', '2')
 
@@ -400,6 +417,12 @@ if spark_session is not None:
         ltv_input_spark = ltv_input_spark.withColumn(col_name, F.col(col_name).cast("double"))
 
     data_ltv_snow = ltv_input_spark.toPandas()
+    if data_ltv_snow.empty:
+        raise RuntimeError(
+            "JC_PRED_LTV_INPUT no tiene filas para el periodo_prediccion solicitado "
+            f"({periodo_prediccion}). "
+            "Verifica que la tabla este actualizada para ese periodo o ajusta PERIODO_PREDICCION."
+        )
 else:
     if snow_con is None:
         raise ImportError(
@@ -974,12 +997,8 @@ df['Ingresos_t-1'] = 12*df['Ingresos_mva_13to24m']
 
 columnas_a_transformar = ['Costos_t-1','Costos_t','Ingresos_t-1','Ingresos_t']
 
-qtransformer = QuantileTransformer(n_quantiles=100) #De nuevo seed?
-
 for col in columnas_a_transformar:
-    #df[col].fillna(0, inplace=True)
-    qtransformer.fit(df[col].dropna().values.reshape(-1, 1))
-    df['perc_' + col] = qtransformer.transform(df[col].values.reshape(-1, 1)).flatten()
+    _fit_transform_quantiles_safe(df, col, 'perc_' + col, n_quantiles=100)
 
 
 df.head(2)
@@ -1244,10 +1263,12 @@ ltv_fuga0 = calculo_ltv_fuga0(df_ltv, cols_margen)
 
 quant_dict_nueva = {}
 for column in [m for m in df_ltv.columns if 'predicted_Margen' in m]:
-    df_ltv[column + '_perc'] = np.nan
-    quant_dict_nueva[column + '_perc'] = QuantileTransformer(n_quantiles=100) #seed?
-    df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
-        (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
+    quant_dict_nueva[column + '_perc'] = _fit_transform_quantiles_safe(
+        df_ltv,
+        column,
+        column + '_perc',
+        n_quantiles=100,
+    )
 
 df_ltv.head(3)
 
@@ -1261,10 +1282,12 @@ df_ltv['ltv_fuga0_predicted'] = ltv_fuga0['LTV_predicted']
 
 quant_dict_ltv = {}
 for column in [m for m in df_ltv.columns if 'ltv' in m]:
-    df_ltv[column + '_perc'] = np.nan
-    quant_dict_nueva[column + '_perc'] = QuantileTransformer(n_quantiles=100)
-    df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
-        (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
+    quant_dict_nueva[column + '_perc'] = _fit_transform_quantiles_safe(
+        df_ltv,
+        column,
+        column + '_perc',
+        n_quantiles=100,
+    )
 
 df_ltv.head(3)
 
