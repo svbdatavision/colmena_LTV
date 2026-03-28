@@ -30,6 +30,7 @@ import os
 import sys
 import shutil
 from pathlib import Path
+from decimal import Decimal
 from numba import njit, prange
 import pandas as pd
 import json
@@ -373,7 +374,32 @@ snow_warehouse = "P_OPX"
 
 if spark_session is not None:
     print("Leyendo EST.P_DDV_EST.JC_PRED_LTV_INPUT desde Spark/Databricks...")
-    data_ltv_snow = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT").toPandas()
+    from pyspark.sql import functions as F
+    import pyspark.sql.types as T
+
+    ltv_input_spark = spark_session.table("EST.P_DDV_EST.JC_PRED_LTV_INPUT")
+
+    # Filtrar por periodo objetivo antes de toPandas para evitar OOM en driver.
+    if "PERIODO" in ltv_input_spark.columns:
+        ltv_input_spark = ltv_input_spark.filter(F.col("PERIODO") == F.lit(periodo_prediccion))
+    elif "periodo" in ltv_input_spark.columns:
+        ltv_input_spark = ltv_input_spark.filter(F.col("periodo") == F.lit(periodo_prediccion))
+    else:
+        print(
+            "Advertencia: no se encontro columna PERIODO/periodo en JC_PRED_LTV_INPUT; "
+            "se usara la tabla completa (puede consumir mucha memoria)."
+        )
+
+    # DecimalType -> double para reducir costo de serializacion Arrow/Pandas.
+    decimal_cols = [
+        field.name
+        for field in ltv_input_spark.schema.fields
+        if isinstance(field.dataType, T.DecimalType)
+    ]
+    for col_name in decimal_cols:
+        ltv_input_spark = ltv_input_spark.withColumn(col_name, F.col(col_name).cast("double"))
+
+    data_ltv_snow = ltv_input_spark.toPandas()
 else:
     if snow_con is None:
         raise ImportError(
@@ -396,6 +422,12 @@ else:
         data_ltv_snow = cur.fetch_pandas_all()
 
 data_ltv_snow.to_csv(datos_ltv_folder + nombre_base, index=False, compression='gzip')
+
+# Evitar que numeros queden como Decimal en pandas (alto costo de memoria)
+for col_name in data_ltv_snow.columns:
+    series_non_null = data_ltv_snow[col_name].dropna()
+    if not series_non_null.empty and isinstance(series_non_null.iloc[0], Decimal):
+        data_ltv_snow[col_name] = pd.to_numeric(data_ltv_snow[col_name], errors="coerce")
 
 
 # In[ ]:
