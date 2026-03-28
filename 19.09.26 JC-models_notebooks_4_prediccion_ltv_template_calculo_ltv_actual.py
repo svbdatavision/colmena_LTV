@@ -974,7 +974,7 @@ df['Ingresos_t-1'] = 12*df['Ingresos_mva_13to24m']
 
 columnas_a_transformar = ['Costos_t-1','Costos_t','Ingresos_t-1','Ingresos_t']
 
-qtransformer = QuantileTransformer(100) #De nuevo seed?
+qtransformer = QuantileTransformer(n_quantiles=100) #De nuevo seed?
 
 for col in columnas_a_transformar:
     #df[col].fillna(0, inplace=True)
@@ -1245,7 +1245,7 @@ ltv_fuga0 = calculo_ltv_fuga0(df_ltv, cols_margen)
 quant_dict_nueva = {}
 for column in [m for m in df_ltv.columns if 'predicted_Margen' in m]:
     df_ltv[column + '_perc'] = np.nan
-    quant_dict_nueva[column + '_perc'] = QuantileTransformer(100) #seed?
+    quant_dict_nueva[column + '_perc'] = QuantileTransformer(n_quantiles=100) #seed?
     df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
         (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
 
@@ -1262,7 +1262,7 @@ df_ltv['ltv_fuga0_predicted'] = ltv_fuga0['LTV_predicted']
 quant_dict_ltv = {}
 for column in [m for m in df_ltv.columns if 'ltv' in m]:
     df_ltv[column + '_perc'] = np.nan
-    quant_dict_nueva[column + '_perc'] = QuantileTransformer(100)
+    quant_dict_nueva[column + '_perc'] = QuantileTransformer(n_quantiles=100)
     df_ltv.loc[~df_ltv[column].isna(), column + '_perc'] = (quant_dict_nueva[column + '_perc'].fit_transform(
         (df_ltv.loc[~df_ltv[column].isna()][column].values).reshape([-1, 1])).ravel())
 
